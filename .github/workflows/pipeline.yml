@@ -6,18 +6,27 @@
 name: vault-smoke-test
 'on':
   workflow_dispatch: null
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  APP_NAME: vault-smoke-test
+  SMOKE_IMAGE: piico-vault-smoke:demo
 permissions:
   contents: read
 jobs:
-  vault-read-check:
-    name: Vault read check
-    runs-on: ubuntu-latest
-    timeout-minutes: 1
+  prepare-smoke-website:
+    name: Prepare smoke website
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
     permissions:
       contents: read
       id-token: write
+    env:
+      APP_NAME: vault-smoke-test
+      SMOKE_IMAGE: piico-vault-smoke:demo
     steps:
-    - name: Checkout primary repository
+    - name: Checkout source
       uses: actions/checkout@v4
       with:
         ref: main
@@ -97,40 +106,458 @@ jobs:
         \ exc:\n        print(f\"Piπco Vault: {exc}\", file=sys.stderr)\n    except (KeyError, TypeError, ValueError, OSError):\n\
         \        print(\"Piπco Vault: unable to load the secret or start the command.\", file=sys.stderr)\n    return 1\n\n\
         \nif __name__ == \"__main__\":\n    sys.exit(main())\nPIICO_VAULT_LOADER"
-    - name: Verify Vault supplied the test value
+    - name: Verify Vault and prepare HTML
       run: "VAULT_ADDR=https://piico-vaul.duckdns.org python3 \"$RUNNER_TEMP/piico_vault.py\" --bindings '{\"PAYMENTS_VAULT_PROBE\"\
         :\"secret/piico/c30a0d3b-1c2e-494c-b926-2dbd0caf23db/staging/0e99ad28-25c8-4b09-9cff-ece523f2db70\"}' -- sh -e -c\
-        \ 'set +x\ncase \",${PIICO_VAULT_RESOLVED:-},\" in\n  *,PAYMENTS_VAULT_PROBE,*) ;;\n  *) printf '\"'\"'%s\\n'\"'\"\
-        ' '\"'\"'::error::In Piico, turn on Secret for PAYMENTS_VAULT_PROBE and link a staging Vault secret.'\"'\"'; exit\
-        \ 1 ;;\nesac\nif [ -z \"${PAYMENTS_VAULT_PROBE:-}\" ]; then\n  printf '\"'\"'%s\\n'\"'\"' '\"'\"'::error::Vault did\
-        \ not supply a value for PAYMENTS_VAULT_PROBE.'\"'\"'\n  exit 1\nfi\nprintf '\"'\"'%s\\n'\"'\"' '\"'\"'PASS: GitHub\
-        \ Actions read the linked Vault secret without displaying it.'\"'\"''"
+        \ 'set -eu\nset +x\npython3 - <<'\"'\"'PY'\"'\"'\nimport os\nimport sys\nnames = os.environ.get(\"PIICO_VAULT_RESOLVED\"\
+        , \"\").split(\",\")\nif \"PAYMENTS_VAULT_PROBE\" not in names or not os.environ.get(\"PAYMENTS_VAULT_PROBE\"):\n\
+        \    sys.exit(\"Vault did not resolve the linked smoke probe.\")\nprint(\"PASS: Vault supplied the smoke probe; its\
+        \ value was not displayed.\")\nPY\nmkdir -p smoke-site\ncat > smoke-site/index.html <<'\"'\"'HTML'\"'\"'\n<!doctype\
+        \ html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"\
+        >\n<title>Piπco environment smoke test</title>\n<style>body{margin:0;padding:4rem 1.5rem;background:#f4f5fc;color:#102b68;font:18px/1.6\
+        \ system-ui}main{max-width:42rem;margin:auto;padding:2rem;background:white;border-radius:20px;border-top:6px solid\
+        \ #7b3fe4}a{color:#a6005b}</style>\n</head><body><main data-pipeline=\"vault-smoke-test\"><h1>Piπco multi-environment\
+        \ demo</h1>\n<p>One container image is promoted through DEV, TEST and STAGING.</p>\n<p>Vault secrets are checked at\
+        \ runtime and are never written into this page or image.</p>\n<a href=\"/health.json\">Environment health check</a></main></body></html>\n\
+        HTML\ncat > smoke-site/Dockerfile <<'\"'\"'DOCKERFILE'\"'\"'\nFROM nginx:alpine\nCOPY index.html /usr/share/nginx/html/index.html\n\
+        DOCKERFILE\ntest -s smoke-site/index.html\n'"
       env:
         PIICO_VAULT_CI_URL: https://piico-vaul.duckdns.org/api/vault/ci/resolve
         PIICO_VAULT_CI_GRANT: 98f84aa075a7036f007a458afbdddd7119d1b7e0fcfdc4840d2b5aa5987dae0f
-  image-vault-smoke:
-    name: 'Image: vault-smoke'
-    runs-on: ubuntu-latest
+    - name: 'Upload artifact: vault-smoke-context'
+      uses: actions/upload-artifact@v6.0.0
+      with:
+        name: vault-smoke-context
+        path: smoke-site
+        if-no-files-found: error
+  image-piico-vault-smoke:
+    name: 'Image: piico-vault-smoke'
+    runs-on: ubuntu-24.04
     needs:
-    - vault-read-check
-    if: ${{ false }}
+    - prepare-smoke-website
     steps:
-    - run: echo 'Image job disabled'
+    - name: Download Docker build context
+      uses: actions/download-artifact@v7.0.0
+      with:
+        name: vault-smoke-context
+    - name: Build image
+      run: docker build -f ./Dockerfile -t piico-vault-smoke:demo .
+    - name: Save built image
+      run: docker image save --output "$RUNNER_TEMP/image-piico-vault-smoke.tar" piico-vault-smoke:demo
+    - name: Upload built image
+      uses: actions/upload-artifact@v6.0.0
+      with:
+        name: image-piico-vault-smoke
+        path: ${{ runner.temp }}/image-piico-vault-smoke.tar
+        if-no-files-found: error
+        retention-days: 1
+  deploy-dev:
+    name: 'Deploy: dev'
+    runs-on: ubuntu-24.04
+    needs:
+    - image-piico-vault-smoke
+    if: github.event_name == 'workflow_dispatch'
+    environment:
+      name: dev
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v4
+    - name: Resolve deployment images
+      run: 'echo "Deploying piico-vault-smoke:demo" '
+    - name: Download piico-vault-smoke image
+      uses: actions/download-artifact@v7.0.0
+      with:
+        name: image-piico-vault-smoke
+        path: ${{ runner.temp }}
+    - name: Load piico-vault-smoke image
+      run: docker image load --input "$RUNNER_TEMP/image-piico-vault-smoke.tar"
+    - name: Prepare Piπco Vault loader
+      run: "cat > \"$RUNNER_TEMP/piico_vault.py\" <<'PIICO_VAULT_LOADER'\n\"\"\"Load a Piπco Vault binding and run a command\
+        \ with the values in its environment.\"\"\"\nimport argparse\nimport json\nimport os\nimport re\nimport ssl\nimport\
+        \ subprocess\nimport sys\nfrom pathlib import Path\nfrom urllib.error import HTTPError\nfrom urllib.parse import parse_qsl,\
+        \ urlencode, urlsplit\nfrom urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_opener\n\n\nclass\
+        \ NoRedirect(HTTPRedirectHandler):\n    def redirect_request(self, req, fp, code, msg, headers, newurl):\n       \
+        \ return None\n\n\nclass VaultError(ValueError):\n    pass\n\n\ndef github_assertion(source, audience):\n    issuer_url\
+        \ = urlsplit(source.get(\"ACTIONS_ID_TOKEN_REQUEST_URL\", \"\"))\n    request_token = source.get(\"ACTIONS_ID_TOKEN_REQUEST_TOKEN\"\
+        )\n    host = issuer_url.hostname or \"\"\n    if (\n        not request_token or issuer_url.scheme != \"https\" or\
+        \ issuer_url.username is not None\n        or not host.endswith(\".actions.githubusercontent.com\") or issuer_url.fragment\n\
+        \    ):\n        raise VaultError(\"GitHub Actions did not provide valid OIDC credentials. Check the job's id-token\
+        \ permission.\")\n\n    query = dict(parse_qsl(issuer_url.query, keep_blank_values=True))\n    query[\"audience\"\
+        ] = audience\n    request = Request(\n        issuer_url._replace(query=urlencode(query)).geturl(),\n        headers={\"\
+        Authorization\": f\"Bearer {request_token}\", \"Accept\": \"application/json\"},\n    )\n    try:\n        with build_opener(NoRedirect()).open(request,\
+        \ timeout=10) as response:\n            jwt = json.load(response)[\"value\"]\n        if not isinstance(jwt, str)\
+        \ or not jwt:\n            raise ValueError(\"Missing assertion\")\n    except (OSError, ValueError, KeyError, TypeError):\n\
+        \        raise VaultError(\"GitHub Actions could not issue an OIDC token.\") from None\n    return jwt\n\n\ndef github_oidc_token(address,\
+        \ vault_client, source, headers):\n    jwt = github_assertion(source, source.get(\"VAULT_GITHUB_OIDC_AUDIENCE\", \"\
+        vault\"))\n\n    request = Request(\n        f\"{address}/v1/auth/jwt/login\",\n        data=json.dumps({\"role\"\
+        : source[\"VAULT_GITHUB_OIDC_ROLE\"], \"jwt\": jwt}).encode(\"utf-8\"),\n        headers={**headers, \"Content-Type\"\
+        : \"application/json\"},\n    )\n    try:\n        with vault_client.open(request, timeout=10) as response:\n    \
+        \        token = json.load(response)[\"auth\"][\"client_token\"]\n        if not isinstance(token, str) or not token:\n\
+        \            raise ValueError(\"Missing token\")\n    except HTTPError as exc:\n        raise VaultError(f\"Vault\
+        \ rejected GitHub OIDC login (HTTP {exc.code}). Check the role's workflow and branch claims.\") from None\n    except\
+        \ (OSError, ValueError, KeyError, TypeError):\n        raise VaultError(\"Unable to complete Vault OIDC login.\")\
+        \ from None\n    return token\n\n\ndef github_granted_values(bindings, client, source):\n    address = source.get(\"\
+        PIICO_VAULT_CI_URL\", \"\")\n    url = urlsplit(address)\n    if url.scheme != \"https\" or not url.hostname or url.username\
+        \ is not None or url.query or url.fragment:\n        raise VaultError(\"Configure an HTTPS Piπco Vault workflow service\
+        \ URL.\")\n    assertion = github_assertion(source, \"piico-vault-ci\")\n    data = {\"grant\": source[\"PIICO_VAULT_CI_GRANT\"\
+        ], \"references\": list(dict.fromkeys(bindings.values()))}\n    request = Request(\n        address, data=json.dumps(data).encode(\"\
+        utf-8\"),\n        headers={\"Authorization\": f\"Bearer {assertion}\", \"Content-Type\": \"application/json\"},\n\
+        \    )\n    try:\n        with client.open(request, timeout=20) as response:\n            values = json.load(response)[\"\
+        values\"]\n        return {name: values[ref] for name, ref in bindings.items()}\n    except HTTPError as exc:\n  \
+        \      raise VaultError(f\"Piπco Vault workflow access failed (HTTP {exc.code}). Check the repository, branch and\
+        \ workflow path used when pushing.\") from None\n    except (OSError, ValueError, KeyError, TypeError):\n        raise\
+        \ VaultError(\"Piπco Vault could not return the workflow's secrets.\") from None\n\n\ndef vault_values(bindings, client,\
+        \ source):\n    addr = source.get(\"VAULT_ADDR\", \"\").rstrip(\"/\")\n    url = urlsplit(addr)\n    loopback = url.hostname\
+        \ in {\"localhost\", \"127.0.0.1\", \"::1\"}\n    local_http = url.scheme == \"http\" and loopback\n    if not url.hostname\
+        \ or not (url.scheme == \"https\" or local_http):\n        raise VaultError(\"Set VAULT_ADDR to an HTTPS Vault endpoint.\"\
+        )\n    if loopback and source.get(\"RUNNER_ENVIRONMENT\") == \"github-hosted\":\n        raise VaultError(\"A GitHub-hosted\
+        \ runner cannot reach the Vault on your PC. Configure a reachable Vault HTTPS address.\")\n\n    headers = {}\n  \
+        \  if source.get(\"VAULT_NAMESPACE\"):\n        headers[\"X-Vault-Namespace\"] = source[\"VAULT_NAMESPACE\"]\n   \
+        \ if source.get(\"VAULT_GITHUB_OIDC_ROLE\"):\n        if url.scheme != \"https\":\n            raise VaultError(\"\
+        Use an HTTPS Vault endpoint for GitHub OIDC.\")\n        token = github_oidc_token(addr, client, source, headers)\n\
+        \    else:\n        token = source.get(\"VAULT_TOKEN\")\n        if not token and source.get(\"VAULT_TOKEN_FILE\"\
+        ):\n            token = Path(source[\"VAULT_TOKEN_FILE\"]).read_text(encoding=\"utf-8\").strip()\n        if not token:\n\
+        \            raise VaultError(\"Authenticate to Vault and supply VAULT_TOKEN or VAULT_TOKEN_FILE.\")\n    headers[\"\
+        X-Vault-Token\"] = token\n    values = {}\n    for name, ref in bindings.items():\n        mount, path = ref.split(\"\
+        /\", 1)\n        try:\n            with client.open(Request(f\"{addr}/v1/{mount}/data/{path}\", headers=headers),\
+        \ timeout=10) as response:\n                values[name] = json.load(response)[\"data\"][\"data\"][\"value\"]\n  \
+        \      except HTTPError as exc:\n            raise VaultError(f\"Vault denied or could not resolve {name} (HTTP {exc.code}).\"\
+        ) from None\n    return values\n\n\ndef resolved_environment(bindings, source):\n    credentials = {\n        \"VAULT_TOKEN\"\
+        , \"VAULT_TOKEN_FILE\", \"ACTIONS_ID_TOKEN_REQUEST_TOKEN\", \"ACTIONS_ID_TOKEN_REQUEST_URL\",\n    }\n    env = {key:\
+        \ value for key, value in source.items() if key not in credentials}\n\n    uuid = r\"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\"\
+        \n    reference = rf\"[A-Za-z0-9_-]{{1,32}}/piico/{uuid}/[a-z0-9][a-z0-9_-]{{0,47}}/{uuid}\"\n    for name, ref in\
+        \ bindings.items():\n        if not re.fullmatch(r\"(?!(?:VAULT_|PIICO_VAULT_))[A-Za-z_][A-Za-z0-9_]{0,127}\", name):\n\
+        \            raise VaultError(\"Invalid environment variable name in Vault bindings.\")\n        if not isinstance(ref,\
+        \ str) or not re.fullmatch(reference, ref):\n            raise VaultError(f\"Invalid Vault reference for {name}.\"\
+        )\n\n    context = ssl.create_default_context(cafile=source.get(\"VAULT_CACERT\") or None)\n    client = build_opener(NoRedirect(),\
+        \ HTTPSHandler(context=context))\n    if source.get(\"PIICO_VAULT_CI_GRANT\"):\n        values = github_granted_values(bindings,\
+        \ client, source)\n    else:\n        values = vault_values(bindings, client, source)\n    for name, value in values.items():\n\
+        \        if not isinstance(value, str) or not value or \"\\0\" in value:\n            raise VaultError(f\"Vault returned\
+        \ an unusable value for {name}.\")\n        env[name] = value\n    env[\"PIICO_VAULT_RESOLVED\"] = \",\".join(bindings)\n\
+        \    return env\n\n\ndef main():\n    parser = argparse.ArgumentParser(description=__doc__)\n    mapping = parser.add_mutually_exclusive_group(required=True)\n\
+        \    mapping.add_argument(\"--bindings\", help=\"JSON map of environment names to Piπco Vault references\")\n    mapping.add_argument(\"\
+        --bindings-env\", action=\"store_true\", help=\"Read PIICO_VAULT_BINDINGS (CodeBuild)\")\n    parser.add_argument(\"\
+        command\", nargs=argparse.REMAINDER)\n    args = parser.parse_args()\n    command = args.command[1:] if args.command[:1]\
+        \ == [\"--\"] else args.command\n    if not command:\n        parser.error(\"provide a command after --\")\n    try:\n\
+        \        bindings = json.loads(os.environ.get(\"PIICO_VAULT_BINDINGS\", \"\") if args.bindings_env else args.bindings)\n\
+        \    except ValueError:\n        parser.error(\"bindings must be a JSON object\")\n    if not isinstance(bindings,\
+        \ dict) or not bindings:\n        parser.error(\"bindings must be a non-empty JSON object\")\n    try:\n        env\
+        \ = resolved_environment(bindings, os.environ)\n        if os.name != \"nt\":\n            os.execvpe(command[0],\
+        \ command, env)\n        return subprocess.run(command, env=env, check=False).returncode\n    except VaultError as\
+        \ exc:\n        print(f\"Piπco Vault: {exc}\", file=sys.stderr)\n    except (KeyError, TypeError, ValueError, OSError):\n\
+        \        print(\"Piπco Vault: unable to load the secret or start the command.\", file=sys.stderr)\n    return 1\n\n\
+        \nif __name__ == \"__main__\":\n    sys.exit(main())\nPIICO_VAULT_LOADER"
+    - name: Verify Vault and serve DEV HTML
+      run: "VAULT_ADDR=https://piico-vaul.duckdns.org python3 \"$RUNNER_TEMP/piico_vault.py\" --bindings '{\"PAYMENTS_VAULT_PROBE\"\
+        :\"secret/piico/c30a0d3b-1c2e-494c-b926-2dbd0caf23db/staging/0e99ad28-25c8-4b09-9cff-ece523f2db70\"}' -- sh -e -c\
+        \ 'set -eu\nset +x\npython3 - <<'\"'\"'PY'\"'\"'\nimport os\nimport sys\nnames = os.environ.get(\"PIICO_VAULT_RESOLVED\"\
+        , \"\").split(\",\")\nif \"PAYMENTS_VAULT_PROBE\" not in names or not os.environ.get(\"PAYMENTS_VAULT_PROBE\"):\n\
+        \    sys.exit(\"Vault did not resolve the linked smoke probe.\")\nprint(\"PASS: Vault supplied the smoke probe; its\
+        \ value was not displayed.\")\nPY\npython3 - <<'\"'\"'PY'\"'\"'\nimport os\nimport sys\nexpected = os.environ[\"EXPECTED_ENV\"\
+        ]\nif os.environ.get(\"APP_ENV\") != expected:\n    sys.exit(\"The deployment received another environment'\"'\"'s\
+        \ configuration.\")\nif os.environ.get(\"ENV_MESSAGE\") != f\"{expected.upper()} environment configuration loaded\"\
+        :\n    sys.exit(\"The environment-specific message was not applied.\")\nPY\ncontainer=\"piico-${APP_ENV}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\"\
+        \ntrap '\"'\"'docker rm -f \"$container\" >/dev/null 2>&1 || true'\"'\"' EXIT\ndocker run --pull=never --detach --name\
+        \ \"$container\" --publish 127.0.0.1::80 \"$SMOKE_IMAGE\"\nendpoint=\"http://$(docker port \"$container\" 80/tcp |\
+        \ head -n 1)\"\ncurl --fail --silent --show-error --retry 8 --retry-connrefused --retry-delay 1 --max-time 4 \"$endpoint/\"\
+        \ > \"$RUNNER_TEMP/piico-smoke-page.html\"\ngrep -q '\"'\"'data-pipeline=\"vault-smoke-test\"'\"'\"' \"$RUNNER_TEMP/piico-smoke-page.html\"\
+        \npython3 - <<'\"'\"'PY'\"'\"'\nimport json\nimport os\nfrom pathlib import Path\ndata = {\"environment\": os.environ[\"\
+        APP_ENV\"], \"message\": os.environ[\"ENV_MESSAGE\"], \"vault_verified\": True}\nPath(os.environ[\"RUNNER_TEMP\"],\
+        \ \"piico-smoke-health.json\").write_text(json.dumps(data), encoding=\"utf-8\")\nPY\ndocker cp \"$RUNNER_TEMP/piico-smoke-health.json\"\
+        \ \"$container:/usr/share/nginx/html/health.json\"\ncurl --fail --silent --show-error --retry 3 --retry-connrefused\
+        \ --retry-delay 1 --max-time 4 \"$endpoint/health.json\" > \"$RUNNER_TEMP/piico-smoke-response.json\"\npython3 - <<'\"\
+        '\"'PY'\"'\"'\nimport json\nimport os\nfrom pathlib import Path\nresult = json.loads(Path(os.environ[\"RUNNER_TEMP\"\
+        ], \"piico-smoke-response.json\").read_text(encoding=\"utf-8\"))\nassert result[\"environment\"] == os.environ[\"\
+        EXPECTED_ENV\"], \"HTTP environment does not match the deployment\"\nassert result[\"vault_verified\"] is True, \"\
+        Vault check was not recorded\"\nprint(\"PASS: HTML and HTTP health checks passed for \" + result[\"environment\"].upper())\n\
+        PY\nimage_id=\"$(docker image inspect \"$SMOKE_IMAGE\" --format '\"'\"'{{.Id}}'\"'\"')\"\nprintf '\"'\"'### %s passed\\\
+        n\\n- Vault probe resolved without exposing its value.\\n- Environment variables matched this job.\\n- HTML and health\
+        \ endpoint returned HTTP 200.\\n- Promoted image: `%s`\\n- Test container was removed at job exit.\\n'\"'\"' \"$APP_ENV\"\
+        \ \"$image_id\" >> \"$GITHUB_STEP_SUMMARY\"\n'"
+      env:
+        PIICO_VAULT_CI_URL: https://piico-vaul.duckdns.org/api/vault/ci/resolve
+        PIICO_VAULT_CI_GRANT: 98f84aa075a7036f007a458afbdddd7119d1b7e0fcfdc4840d2b5aa5987dae0f
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      APP_NAME: vault-smoke-test
+      SMOKE_IMAGE: piico-vault-smoke:demo
+      APP_ENV: dev
+      ENV_MESSAGE: DEV environment configuration loaded
+      EXPECTED_ENV: dev
+  deploy-test:
+    name: 'Deploy: test'
+    runs-on: ubuntu-24.04
+    needs:
+    - image-piico-vault-smoke
+    - deploy-dev
+    if: github.event_name == 'workflow_dispatch'
+    environment:
+      name: test
+    steps:
+    - name: Checkout source
+      uses: actions/checkout@v4
+    - name: Resolve deployment images
+      run: 'echo "Deploying piico-vault-smoke:demo" '
+    - name: Download piico-vault-smoke image
+      uses: actions/download-artifact@v7.0.0
+      with:
+        name: image-piico-vault-smoke
+        path: ${{ runner.temp }}
+    - name: Load piico-vault-smoke image
+      run: docker image load --input "$RUNNER_TEMP/image-piico-vault-smoke.tar"
+    - name: Prepare Piπco Vault loader
+      run: "cat > \"$RUNNER_TEMP/piico_vault.py\" <<'PIICO_VAULT_LOADER'\n\"\"\"Load a Piπco Vault binding and run a command\
+        \ with the values in its environment.\"\"\"\nimport argparse\nimport json\nimport os\nimport re\nimport ssl\nimport\
+        \ subprocess\nimport sys\nfrom pathlib import Path\nfrom urllib.error import HTTPError\nfrom urllib.parse import parse_qsl,\
+        \ urlencode, urlsplit\nfrom urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_opener\n\n\nclass\
+        \ NoRedirect(HTTPRedirectHandler):\n    def redirect_request(self, req, fp, code, msg, headers, newurl):\n       \
+        \ return None\n\n\nclass VaultError(ValueError):\n    pass\n\n\ndef github_assertion(source, audience):\n    issuer_url\
+        \ = urlsplit(source.get(\"ACTIONS_ID_TOKEN_REQUEST_URL\", \"\"))\n    request_token = source.get(\"ACTIONS_ID_TOKEN_REQUEST_TOKEN\"\
+        )\n    host = issuer_url.hostname or \"\"\n    if (\n        not request_token or issuer_url.scheme != \"https\" or\
+        \ issuer_url.username is not None\n        or not host.endswith(\".actions.githubusercontent.com\") or issuer_url.fragment\n\
+        \    ):\n        raise VaultError(\"GitHub Actions did not provide valid OIDC credentials. Check the job's id-token\
+        \ permission.\")\n\n    query = dict(parse_qsl(issuer_url.query, keep_blank_values=True))\n    query[\"audience\"\
+        ] = audience\n    request = Request(\n        issuer_url._replace(query=urlencode(query)).geturl(),\n        headers={\"\
+        Authorization\": f\"Bearer {request_token}\", \"Accept\": \"application/json\"},\n    )\n    try:\n        with build_opener(NoRedirect()).open(request,\
+        \ timeout=10) as response:\n            jwt = json.load(response)[\"value\"]\n        if not isinstance(jwt, str)\
+        \ or not jwt:\n            raise ValueError(\"Missing assertion\")\n    except (OSError, ValueError, KeyError, TypeError):\n\
+        \        raise VaultError(\"GitHub Actions could not issue an OIDC token.\") from None\n    return jwt\n\n\ndef github_oidc_token(address,\
+        \ vault_client, source, headers):\n    jwt = github_assertion(source, source.get(\"VAULT_GITHUB_OIDC_AUDIENCE\", \"\
+        vault\"))\n\n    request = Request(\n        f\"{address}/v1/auth/jwt/login\",\n        data=json.dumps({\"role\"\
+        : source[\"VAULT_GITHUB_OIDC_ROLE\"], \"jwt\": jwt}).encode(\"utf-8\"),\n        headers={**headers, \"Content-Type\"\
+        : \"application/json\"},\n    )\n    try:\n        with vault_client.open(request, timeout=10) as response:\n    \
+        \        token = json.load(response)[\"auth\"][\"client_token\"]\n        if not isinstance(token, str) or not token:\n\
+        \            raise ValueError(\"Missing token\")\n    except HTTPError as exc:\n        raise VaultError(f\"Vault\
+        \ rejected GitHub OIDC login (HTTP {exc.code}). Check the role's workflow and branch claims.\") from None\n    except\
+        \ (OSError, ValueError, KeyError, TypeError):\n        raise VaultError(\"Unable to complete Vault OIDC login.\")\
+        \ from None\n    return token\n\n\ndef github_granted_values(bindings, client, source):\n    address = source.get(\"\
+        PIICO_VAULT_CI_URL\", \"\")\n    url = urlsplit(address)\n    if url.scheme != \"https\" or not url.hostname or url.username\
+        \ is not None or url.query or url.fragment:\n        raise VaultError(\"Configure an HTTPS Piπco Vault workflow service\
+        \ URL.\")\n    assertion = github_assertion(source, \"piico-vault-ci\")\n    data = {\"grant\": source[\"PIICO_VAULT_CI_GRANT\"\
+        ], \"references\": list(dict.fromkeys(bindings.values()))}\n    request = Request(\n        address, data=json.dumps(data).encode(\"\
+        utf-8\"),\n        headers={\"Authorization\": f\"Bearer {assertion}\", \"Content-Type\": \"application/json\"},\n\
+        \    )\n    try:\n        with client.open(request, timeout=20) as response:\n            values = json.load(response)[\"\
+        values\"]\n        return {name: values[ref] for name, ref in bindings.items()}\n    except HTTPError as exc:\n  \
+        \      raise VaultError(f\"Piπco Vault workflow access failed (HTTP {exc.code}). Check the repository, branch and\
+        \ workflow path used when pushing.\") from None\n    except (OSError, ValueError, KeyError, TypeError):\n        raise\
+        \ VaultError(\"Piπco Vault could not return the workflow's secrets.\") from None\n\n\ndef vault_values(bindings, client,\
+        \ source):\n    addr = source.get(\"VAULT_ADDR\", \"\").rstrip(\"/\")\n    url = urlsplit(addr)\n    loopback = url.hostname\
+        \ in {\"localhost\", \"127.0.0.1\", \"::1\"}\n    local_http = url.scheme == \"http\" and loopback\n    if not url.hostname\
+        \ or not (url.scheme == \"https\" or local_http):\n        raise VaultError(\"Set VAULT_ADDR to an HTTPS Vault endpoint.\"\
+        )\n    if loopback and source.get(\"RUNNER_ENVIRONMENT\") == \"github-hosted\":\n        raise VaultError(\"A GitHub-hosted\
+        \ runner cannot reach the Vault on your PC. Configure a reachable Vault HTTPS address.\")\n\n    headers = {}\n  \
+        \  if source.get(\"VAULT_NAMESPACE\"):\n        headers[\"X-Vault-Namespace\"] = source[\"VAULT_NAMESPACE\"]\n   \
+        \ if source.get(\"VAULT_GITHUB_OIDC_ROLE\"):\n        if url.scheme != \"https\":\n            raise VaultError(\"\
+        Use an HTTPS Vault endpoint for GitHub OIDC.\")\n        token = github_oidc_token(addr, client, source, headers)\n\
+        \    else:\n        token = source.get(\"VAULT_TOKEN\")\n        if not token and source.get(\"VAULT_TOKEN_FILE\"\
+        ):\n            token = Path(source[\"VAULT_TOKEN_FILE\"]).read_text(encoding=\"utf-8\").strip()\n        if not token:\n\
+        \            raise VaultError(\"Authenticate to Vault and supply VAULT_TOKEN or VAULT_TOKEN_FILE.\")\n    headers[\"\
+        X-Vault-Token\"] = token\n    values = {}\n    for name, ref in bindings.items():\n        mount, path = ref.split(\"\
+        /\", 1)\n        try:\n            with client.open(Request(f\"{addr}/v1/{mount}/data/{path}\", headers=headers),\
+        \ timeout=10) as response:\n                values[name] = json.load(response)[\"data\"][\"data\"][\"value\"]\n  \
+        \      except HTTPError as exc:\n            raise VaultError(f\"Vault denied or could not resolve {name} (HTTP {exc.code}).\"\
+        ) from None\n    return values\n\n\ndef resolved_environment(bindings, source):\n    credentials = {\n        \"VAULT_TOKEN\"\
+        , \"VAULT_TOKEN_FILE\", \"ACTIONS_ID_TOKEN_REQUEST_TOKEN\", \"ACTIONS_ID_TOKEN_REQUEST_URL\",\n    }\n    env = {key:\
+        \ value for key, value in source.items() if key not in credentials}\n\n    uuid = r\"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\"\
+        \n    reference = rf\"[A-Za-z0-9_-]{{1,32}}/piico/{uuid}/[a-z0-9][a-z0-9_-]{{0,47}}/{uuid}\"\n    for name, ref in\
+        \ bindings.items():\n        if not re.fullmatch(r\"(?!(?:VAULT_|PIICO_VAULT_))[A-Za-z_][A-Za-z0-9_]{0,127}\", name):\n\
+        \            raise VaultError(\"Invalid environment variable name in Vault bindings.\")\n        if not isinstance(ref,\
+        \ str) or not re.fullmatch(reference, ref):\n            raise VaultError(f\"Invalid Vault reference for {name}.\"\
+        )\n\n    context = ssl.create_default_context(cafile=source.get(\"VAULT_CACERT\") or None)\n    client = build_opener(NoRedirect(),\
+        \ HTTPSHandler(context=context))\n    if source.get(\"PIICO_VAULT_CI_GRANT\"):\n        values = github_granted_values(bindings,\
+        \ client, source)\n    else:\n        values = vault_values(bindings, client, source)\n    for name, value in values.items():\n\
+        \        if not isinstance(value, str) or not value or \"\\0\" in value:\n            raise VaultError(f\"Vault returned\
+        \ an unusable value for {name}.\")\n        env[name] = value\n    env[\"PIICO_VAULT_RESOLVED\"] = \",\".join(bindings)\n\
+        \    return env\n\n\ndef main():\n    parser = argparse.ArgumentParser(description=__doc__)\n    mapping = parser.add_mutually_exclusive_group(required=True)\n\
+        \    mapping.add_argument(\"--bindings\", help=\"JSON map of environment names to Piπco Vault references\")\n    mapping.add_argument(\"\
+        --bindings-env\", action=\"store_true\", help=\"Read PIICO_VAULT_BINDINGS (CodeBuild)\")\n    parser.add_argument(\"\
+        command\", nargs=argparse.REMAINDER)\n    args = parser.parse_args()\n    command = args.command[1:] if args.command[:1]\
+        \ == [\"--\"] else args.command\n    if not command:\n        parser.error(\"provide a command after --\")\n    try:\n\
+        \        bindings = json.loads(os.environ.get(\"PIICO_VAULT_BINDINGS\", \"\") if args.bindings_env else args.bindings)\n\
+        \    except ValueError:\n        parser.error(\"bindings must be a JSON object\")\n    if not isinstance(bindings,\
+        \ dict) or not bindings:\n        parser.error(\"bindings must be a non-empty JSON object\")\n    try:\n        env\
+        \ = resolved_environment(bindings, os.environ)\n        if os.name != \"nt\":\n            os.execvpe(command[0],\
+        \ command, env)\n        return subprocess.run(command, env=env, check=False).returncode\n    except VaultError as\
+        \ exc:\n        print(f\"Piπco Vault: {exc}\", file=sys.stderr)\n    except (KeyError, TypeError, ValueError, OSError):\n\
+        \        print(\"Piπco Vault: unable to load the secret or start the command.\", file=sys.stderr)\n    return 1\n\n\
+        \nif __name__ == \"__main__\":\n    sys.exit(main())\nPIICO_VAULT_LOADER"
+    - name: Verify Vault and serve TEST HTML
+      run: "VAULT_ADDR=https://piico-vaul.duckdns.org python3 \"$RUNNER_TEMP/piico_vault.py\" --bindings '{\"PAYMENTS_VAULT_PROBE\"\
+        :\"secret/piico/c30a0d3b-1c2e-494c-b926-2dbd0caf23db/staging/0e99ad28-25c8-4b09-9cff-ece523f2db70\"}' -- sh -e -c\
+        \ 'set -eu\nset +x\npython3 - <<'\"'\"'PY'\"'\"'\nimport os\nimport sys\nnames = os.environ.get(\"PIICO_VAULT_RESOLVED\"\
+        , \"\").split(\",\")\nif \"PAYMENTS_VAULT_PROBE\" not in names or not os.environ.get(\"PAYMENTS_VAULT_PROBE\"):\n\
+        \    sys.exit(\"Vault did not resolve the linked smoke probe.\")\nprint(\"PASS: Vault supplied the smoke probe; its\
+        \ value was not displayed.\")\nPY\npython3 - <<'\"'\"'PY'\"'\"'\nimport os\nimport sys\nexpected = os.environ[\"EXPECTED_ENV\"\
+        ]\nif os.environ.get(\"APP_ENV\") != expected:\n    sys.exit(\"The deployment received another environment'\"'\"'s\
+        \ configuration.\")\nif os.environ.get(\"ENV_MESSAGE\") != f\"{expected.upper()} environment configuration loaded\"\
+        :\n    sys.exit(\"The environment-specific message was not applied.\")\nPY\ncontainer=\"piico-${APP_ENV}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\"\
+        \ntrap '\"'\"'docker rm -f \"$container\" >/dev/null 2>&1 || true'\"'\"' EXIT\ndocker run --pull=never --detach --name\
+        \ \"$container\" --publish 127.0.0.1::80 \"$SMOKE_IMAGE\"\nendpoint=\"http://$(docker port \"$container\" 80/tcp |\
+        \ head -n 1)\"\ncurl --fail --silent --show-error --retry 8 --retry-connrefused --retry-delay 1 --max-time 4 \"$endpoint/\"\
+        \ > \"$RUNNER_TEMP/piico-smoke-page.html\"\ngrep -q '\"'\"'data-pipeline=\"vault-smoke-test\"'\"'\"' \"$RUNNER_TEMP/piico-smoke-page.html\"\
+        \npython3 - <<'\"'\"'PY'\"'\"'\nimport json\nimport os\nfrom pathlib import Path\ndata = {\"environment\": os.environ[\"\
+        APP_ENV\"], \"message\": os.environ[\"ENV_MESSAGE\"], \"vault_verified\": True}\nPath(os.environ[\"RUNNER_TEMP\"],\
+        \ \"piico-smoke-health.json\").write_text(json.dumps(data), encoding=\"utf-8\")\nPY\ndocker cp \"$RUNNER_TEMP/piico-smoke-health.json\"\
+        \ \"$container:/usr/share/nginx/html/health.json\"\ncurl --fail --silent --show-error --retry 3 --retry-connrefused\
+        \ --retry-delay 1 --max-time 4 \"$endpoint/health.json\" > \"$RUNNER_TEMP/piico-smoke-response.json\"\npython3 - <<'\"\
+        '\"'PY'\"'\"'\nimport json\nimport os\nfrom pathlib import Path\nresult = json.loads(Path(os.environ[\"RUNNER_TEMP\"\
+        ], \"piico-smoke-response.json\").read_text(encoding=\"utf-8\"))\nassert result[\"environment\"] == os.environ[\"\
+        EXPECTED_ENV\"], \"HTTP environment does not match the deployment\"\nassert result[\"vault_verified\"] is True, \"\
+        Vault check was not recorded\"\nprint(\"PASS: HTML and HTTP health checks passed for \" + result[\"environment\"].upper())\n\
+        PY\nimage_id=\"$(docker image inspect \"$SMOKE_IMAGE\" --format '\"'\"'{{.Id}}'\"'\"')\"\nprintf '\"'\"'### %s passed\\\
+        n\\n- Vault probe resolved without exposing its value.\\n- Environment variables matched this job.\\n- HTML and health\
+        \ endpoint returned HTTP 200.\\n- Promoted image: `%s`\\n- Test container was removed at job exit.\\n'\"'\"' \"$APP_ENV\"\
+        \ \"$image_id\" >> \"$GITHUB_STEP_SUMMARY\"\n'"
+      env:
+        PIICO_VAULT_CI_URL: https://piico-vaul.duckdns.org/api/vault/ci/resolve
+        PIICO_VAULT_CI_GRANT: 98f84aa075a7036f007a458afbdddd7119d1b7e0fcfdc4840d2b5aa5987dae0f
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      APP_NAME: vault-smoke-test
+      SMOKE_IMAGE: piico-vault-smoke:demo
+      APP_ENV: test
+      ENV_MESSAGE: TEST environment configuration loaded
+      EXPECTED_ENV: test
   deploy-staging:
     name: 'Deploy: staging'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
-    - image-vault-smoke
-    if: ${{ false }}
+    - image-piico-vault-smoke
+    - deploy-test
+    if: github.event_name == 'workflow_dispatch'
     environment:
       name: staging
     steps:
-    - name: Checkout primary repository
+    - name: Checkout source
       uses: actions/checkout@v4
     - name: Resolve deployment images
-      run: 'echo "Deploying ghcr.io/vault-smoke:smoke" '
-    - name: Keep staging unchanged
-      run: echo 'Staging is skipped for this Vault check.'
+      run: 'echo "Deploying piico-vault-smoke:demo" '
+    - name: Download piico-vault-smoke image
+      uses: actions/download-artifact@v7.0.0
+      with:
+        name: image-piico-vault-smoke
+        path: ${{ runner.temp }}
+    - name: Load piico-vault-smoke image
+      run: docker image load --input "$RUNNER_TEMP/image-piico-vault-smoke.tar"
+    - name: Prepare Piπco Vault loader
+      run: "cat > \"$RUNNER_TEMP/piico_vault.py\" <<'PIICO_VAULT_LOADER'\n\"\"\"Load a Piπco Vault binding and run a command\
+        \ with the values in its environment.\"\"\"\nimport argparse\nimport json\nimport os\nimport re\nimport ssl\nimport\
+        \ subprocess\nimport sys\nfrom pathlib import Path\nfrom urllib.error import HTTPError\nfrom urllib.parse import parse_qsl,\
+        \ urlencode, urlsplit\nfrom urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_opener\n\n\nclass\
+        \ NoRedirect(HTTPRedirectHandler):\n    def redirect_request(self, req, fp, code, msg, headers, newurl):\n       \
+        \ return None\n\n\nclass VaultError(ValueError):\n    pass\n\n\ndef github_assertion(source, audience):\n    issuer_url\
+        \ = urlsplit(source.get(\"ACTIONS_ID_TOKEN_REQUEST_URL\", \"\"))\n    request_token = source.get(\"ACTIONS_ID_TOKEN_REQUEST_TOKEN\"\
+        )\n    host = issuer_url.hostname or \"\"\n    if (\n        not request_token or issuer_url.scheme != \"https\" or\
+        \ issuer_url.username is not None\n        or not host.endswith(\".actions.githubusercontent.com\") or issuer_url.fragment\n\
+        \    ):\n        raise VaultError(\"GitHub Actions did not provide valid OIDC credentials. Check the job's id-token\
+        \ permission.\")\n\n    query = dict(parse_qsl(issuer_url.query, keep_blank_values=True))\n    query[\"audience\"\
+        ] = audience\n    request = Request(\n        issuer_url._replace(query=urlencode(query)).geturl(),\n        headers={\"\
+        Authorization\": f\"Bearer {request_token}\", \"Accept\": \"application/json\"},\n    )\n    try:\n        with build_opener(NoRedirect()).open(request,\
+        \ timeout=10) as response:\n            jwt = json.load(response)[\"value\"]\n        if not isinstance(jwt, str)\
+        \ or not jwt:\n            raise ValueError(\"Missing assertion\")\n    except (OSError, ValueError, KeyError, TypeError):\n\
+        \        raise VaultError(\"GitHub Actions could not issue an OIDC token.\") from None\n    return jwt\n\n\ndef github_oidc_token(address,\
+        \ vault_client, source, headers):\n    jwt = github_assertion(source, source.get(\"VAULT_GITHUB_OIDC_AUDIENCE\", \"\
+        vault\"))\n\n    request = Request(\n        f\"{address}/v1/auth/jwt/login\",\n        data=json.dumps({\"role\"\
+        : source[\"VAULT_GITHUB_OIDC_ROLE\"], \"jwt\": jwt}).encode(\"utf-8\"),\n        headers={**headers, \"Content-Type\"\
+        : \"application/json\"},\n    )\n    try:\n        with vault_client.open(request, timeout=10) as response:\n    \
+        \        token = json.load(response)[\"auth\"][\"client_token\"]\n        if not isinstance(token, str) or not token:\n\
+        \            raise ValueError(\"Missing token\")\n    except HTTPError as exc:\n        raise VaultError(f\"Vault\
+        \ rejected GitHub OIDC login (HTTP {exc.code}). Check the role's workflow and branch claims.\") from None\n    except\
+        \ (OSError, ValueError, KeyError, TypeError):\n        raise VaultError(\"Unable to complete Vault OIDC login.\")\
+        \ from None\n    return token\n\n\ndef github_granted_values(bindings, client, source):\n    address = source.get(\"\
+        PIICO_VAULT_CI_URL\", \"\")\n    url = urlsplit(address)\n    if url.scheme != \"https\" or not url.hostname or url.username\
+        \ is not None or url.query or url.fragment:\n        raise VaultError(\"Configure an HTTPS Piπco Vault workflow service\
+        \ URL.\")\n    assertion = github_assertion(source, \"piico-vault-ci\")\n    data = {\"grant\": source[\"PIICO_VAULT_CI_GRANT\"\
+        ], \"references\": list(dict.fromkeys(bindings.values()))}\n    request = Request(\n        address, data=json.dumps(data).encode(\"\
+        utf-8\"),\n        headers={\"Authorization\": f\"Bearer {assertion}\", \"Content-Type\": \"application/json\"},\n\
+        \    )\n    try:\n        with client.open(request, timeout=20) as response:\n            values = json.load(response)[\"\
+        values\"]\n        return {name: values[ref] for name, ref in bindings.items()}\n    except HTTPError as exc:\n  \
+        \      raise VaultError(f\"Piπco Vault workflow access failed (HTTP {exc.code}). Check the repository, branch and\
+        \ workflow path used when pushing.\") from None\n    except (OSError, ValueError, KeyError, TypeError):\n        raise\
+        \ VaultError(\"Piπco Vault could not return the workflow's secrets.\") from None\n\n\ndef vault_values(bindings, client,\
+        \ source):\n    addr = source.get(\"VAULT_ADDR\", \"\").rstrip(\"/\")\n    url = urlsplit(addr)\n    loopback = url.hostname\
+        \ in {\"localhost\", \"127.0.0.1\", \"::1\"}\n    local_http = url.scheme == \"http\" and loopback\n    if not url.hostname\
+        \ or not (url.scheme == \"https\" or local_http):\n        raise VaultError(\"Set VAULT_ADDR to an HTTPS Vault endpoint.\"\
+        )\n    if loopback and source.get(\"RUNNER_ENVIRONMENT\") == \"github-hosted\":\n        raise VaultError(\"A GitHub-hosted\
+        \ runner cannot reach the Vault on your PC. Configure a reachable Vault HTTPS address.\")\n\n    headers = {}\n  \
+        \  if source.get(\"VAULT_NAMESPACE\"):\n        headers[\"X-Vault-Namespace\"] = source[\"VAULT_NAMESPACE\"]\n   \
+        \ if source.get(\"VAULT_GITHUB_OIDC_ROLE\"):\n        if url.scheme != \"https\":\n            raise VaultError(\"\
+        Use an HTTPS Vault endpoint for GitHub OIDC.\")\n        token = github_oidc_token(addr, client, source, headers)\n\
+        \    else:\n        token = source.get(\"VAULT_TOKEN\")\n        if not token and source.get(\"VAULT_TOKEN_FILE\"\
+        ):\n            token = Path(source[\"VAULT_TOKEN_FILE\"]).read_text(encoding=\"utf-8\").strip()\n        if not token:\n\
+        \            raise VaultError(\"Authenticate to Vault and supply VAULT_TOKEN or VAULT_TOKEN_FILE.\")\n    headers[\"\
+        X-Vault-Token\"] = token\n    values = {}\n    for name, ref in bindings.items():\n        mount, path = ref.split(\"\
+        /\", 1)\n        try:\n            with client.open(Request(f\"{addr}/v1/{mount}/data/{path}\", headers=headers),\
+        \ timeout=10) as response:\n                values[name] = json.load(response)[\"data\"][\"data\"][\"value\"]\n  \
+        \      except HTTPError as exc:\n            raise VaultError(f\"Vault denied or could not resolve {name} (HTTP {exc.code}).\"\
+        ) from None\n    return values\n\n\ndef resolved_environment(bindings, source):\n    credentials = {\n        \"VAULT_TOKEN\"\
+        , \"VAULT_TOKEN_FILE\", \"ACTIONS_ID_TOKEN_REQUEST_TOKEN\", \"ACTIONS_ID_TOKEN_REQUEST_URL\",\n    }\n    env = {key:\
+        \ value for key, value in source.items() if key not in credentials}\n\n    uuid = r\"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\"\
+        \n    reference = rf\"[A-Za-z0-9_-]{{1,32}}/piico/{uuid}/[a-z0-9][a-z0-9_-]{{0,47}}/{uuid}\"\n    for name, ref in\
+        \ bindings.items():\n        if not re.fullmatch(r\"(?!(?:VAULT_|PIICO_VAULT_))[A-Za-z_][A-Za-z0-9_]{0,127}\", name):\n\
+        \            raise VaultError(\"Invalid environment variable name in Vault bindings.\")\n        if not isinstance(ref,\
+        \ str) or not re.fullmatch(reference, ref):\n            raise VaultError(f\"Invalid Vault reference for {name}.\"\
+        )\n\n    context = ssl.create_default_context(cafile=source.get(\"VAULT_CACERT\") or None)\n    client = build_opener(NoRedirect(),\
+        \ HTTPSHandler(context=context))\n    if source.get(\"PIICO_VAULT_CI_GRANT\"):\n        values = github_granted_values(bindings,\
+        \ client, source)\n    else:\n        values = vault_values(bindings, client, source)\n    for name, value in values.items():\n\
+        \        if not isinstance(value, str) or not value or \"\\0\" in value:\n            raise VaultError(f\"Vault returned\
+        \ an unusable value for {name}.\")\n        env[name] = value\n    env[\"PIICO_VAULT_RESOLVED\"] = \",\".join(bindings)\n\
+        \    return env\n\n\ndef main():\n    parser = argparse.ArgumentParser(description=__doc__)\n    mapping = parser.add_mutually_exclusive_group(required=True)\n\
+        \    mapping.add_argument(\"--bindings\", help=\"JSON map of environment names to Piπco Vault references\")\n    mapping.add_argument(\"\
+        --bindings-env\", action=\"store_true\", help=\"Read PIICO_VAULT_BINDINGS (CodeBuild)\")\n    parser.add_argument(\"\
+        command\", nargs=argparse.REMAINDER)\n    args = parser.parse_args()\n    command = args.command[1:] if args.command[:1]\
+        \ == [\"--\"] else args.command\n    if not command:\n        parser.error(\"provide a command after --\")\n    try:\n\
+        \        bindings = json.loads(os.environ.get(\"PIICO_VAULT_BINDINGS\", \"\") if args.bindings_env else args.bindings)\n\
+        \    except ValueError:\n        parser.error(\"bindings must be a JSON object\")\n    if not isinstance(bindings,\
+        \ dict) or not bindings:\n        parser.error(\"bindings must be a non-empty JSON object\")\n    try:\n        env\
+        \ = resolved_environment(bindings, os.environ)\n        if os.name != \"nt\":\n            os.execvpe(command[0],\
+        \ command, env)\n        return subprocess.run(command, env=env, check=False).returncode\n    except VaultError as\
+        \ exc:\n        print(f\"Piπco Vault: {exc}\", file=sys.stderr)\n    except (KeyError, TypeError, ValueError, OSError):\n\
+        \        print(\"Piπco Vault: unable to load the secret or start the command.\", file=sys.stderr)\n    return 1\n\n\
+        \nif __name__ == \"__main__\":\n    sys.exit(main())\nPIICO_VAULT_LOADER"
+    - name: Verify Vault and serve STAGING HTML
+      run: "VAULT_ADDR=https://piico-vaul.duckdns.org python3 \"$RUNNER_TEMP/piico_vault.py\" --bindings '{\"PAYMENTS_VAULT_PROBE\"\
+        :\"secret/piico/c30a0d3b-1c2e-494c-b926-2dbd0caf23db/staging/0e99ad28-25c8-4b09-9cff-ece523f2db70\"}' -- sh -e -c\
+        \ 'set -eu\nset +x\npython3 - <<'\"'\"'PY'\"'\"'\nimport os\nimport sys\nnames = os.environ.get(\"PIICO_VAULT_RESOLVED\"\
+        , \"\").split(\",\")\nif \"PAYMENTS_VAULT_PROBE\" not in names or not os.environ.get(\"PAYMENTS_VAULT_PROBE\"):\n\
+        \    sys.exit(\"Vault did not resolve the linked smoke probe.\")\nprint(\"PASS: Vault supplied the smoke probe; its\
+        \ value was not displayed.\")\nPY\npython3 - <<'\"'\"'PY'\"'\"'\nimport os\nimport sys\nexpected = os.environ[\"EXPECTED_ENV\"\
+        ]\nif os.environ.get(\"APP_ENV\") != expected:\n    sys.exit(\"The deployment received another environment'\"'\"'s\
+        \ configuration.\")\nif os.environ.get(\"ENV_MESSAGE\") != f\"{expected.upper()} environment configuration loaded\"\
+        :\n    sys.exit(\"The environment-specific message was not applied.\")\nPY\ncontainer=\"piico-${APP_ENV}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\"\
+        \ntrap '\"'\"'docker rm -f \"$container\" >/dev/null 2>&1 || true'\"'\"' EXIT\ndocker run --pull=never --detach --name\
+        \ \"$container\" --publish 127.0.0.1::80 \"$SMOKE_IMAGE\"\nendpoint=\"http://$(docker port \"$container\" 80/tcp |\
+        \ head -n 1)\"\ncurl --fail --silent --show-error --retry 8 --retry-connrefused --retry-delay 1 --max-time 4 \"$endpoint/\"\
+        \ > \"$RUNNER_TEMP/piico-smoke-page.html\"\ngrep -q '\"'\"'data-pipeline=\"vault-smoke-test\"'\"'\"' \"$RUNNER_TEMP/piico-smoke-page.html\"\
+        \npython3 - <<'\"'\"'PY'\"'\"'\nimport json\nimport os\nfrom pathlib import Path\ndata = {\"environment\": os.environ[\"\
+        APP_ENV\"], \"message\": os.environ[\"ENV_MESSAGE\"], \"vault_verified\": True}\nPath(os.environ[\"RUNNER_TEMP\"],\
+        \ \"piico-smoke-health.json\").write_text(json.dumps(data), encoding=\"utf-8\")\nPY\ndocker cp \"$RUNNER_TEMP/piico-smoke-health.json\"\
+        \ \"$container:/usr/share/nginx/html/health.json\"\ncurl --fail --silent --show-error --retry 3 --retry-connrefused\
+        \ --retry-delay 1 --max-time 4 \"$endpoint/health.json\" > \"$RUNNER_TEMP/piico-smoke-response.json\"\npython3 - <<'\"\
+        '\"'PY'\"'\"'\nimport json\nimport os\nfrom pathlib import Path\nresult = json.loads(Path(os.environ[\"RUNNER_TEMP\"\
+        ], \"piico-smoke-response.json\").read_text(encoding=\"utf-8\"))\nassert result[\"environment\"] == os.environ[\"\
+        EXPECTED_ENV\"], \"HTTP environment does not match the deployment\"\nassert result[\"vault_verified\"] is True, \"\
+        Vault check was not recorded\"\nprint(\"PASS: HTML and HTTP health checks passed for \" + result[\"environment\"].upper())\n\
+        PY\nimage_id=\"$(docker image inspect \"$SMOKE_IMAGE\" --format '\"'\"'{{.Id}}'\"'\"')\"\nprintf '\"'\"'### %s passed\\\
+        n\\n- Vault probe resolved without exposing its value.\\n- Environment variables matched this job.\\n- HTML and health\
+        \ endpoint returned HTTP 200.\\n- Promoted image: `%s`\\n- Test container was removed at job exit.\\n'\"'\"' \"$APP_ENV\"\
+        \ \"$image_id\" >> \"$GITHUB_STEP_SUMMARY\"\n'"
+      env:
+        PIICO_VAULT_CI_URL: https://piico-vaul.duckdns.org/api/vault/ci/resolve
+        PIICO_VAULT_CI_GRANT: 98f84aa075a7036f007a458afbdddd7119d1b7e0fcfdc4840d2b5aa5987dae0f
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      APP_NAME: vault-smoke-test
+      SMOKE_IMAGE: piico-vault-smoke:demo
+      APP_ENV: staging
+      ENV_MESSAGE: STAGING environment configuration loaded
+      EXPECTED_ENV: staging
 
-# Piπco canonical snapshot v1: eyJhcnRpZmFjdFJlcG9zaXRvcnkiOnsidHlwZSI6ImdpdGh1Yi1wYWNrYWdlcyIsInVybCI6ImdoY3IuaW8iLCJ2ZXJzaW9uaW5nU3RyYXRlZ3kiOiJjb21taXQtc2hhIn0sImJ1aWxkSm9icyI6W3siY2FjaGUiOnsiZW5hYmxlZCI6ZmFsc2UsImtleSI6IiJ9LCJpZCI6ImpvYi12YXVsdC1jaGVjayIsIm1hdHJpeCI6eyJlbmFibGVkIjpmYWxzZSwiZmFpbEZhc3QiOnRydWUsInZhbHVlcyI6W10sInZhcmlhYmxlIjoiIn0sIm5hbWUiOiJWYXVsdCByZWFkIGNoZWNrIiwib3V0cHV0cyI6W10sInJ1bnRpbWUiOiJiYXNoIiwic3RlcHMiOlt7ImFydGlmYWN0TmFtZSI6IiIsImNvbW1hbmQiOiJzZXQgK3hcbmNhc2UgXCIsJHtQSUlDT19WQVVMVF9SRVNPTFZFRDotfSxcIiBpblxuICAqLFBBWU1FTlRTX1ZBVUxUX1BST0JFLCopIDs7XG4gICopIHByaW50ZiAnJXNcXG4nICc6OmVycm9yOjpJbiBQaWljbywgdHVybiBvbiBTZWNyZXQgZm9yIFBBWU1FTlRTX1ZBVUxUX1BST0JFIGFuZCBsaW5rIGEgc3RhZ2luZyBWYXVsdCBzZWNyZXQuJzsgZXhpdCAxIDs7XG5lc2FjXG5pZiBbIC16IFwiJHtQQVlNRU5UU19WQVVMVF9QUk9CRTotfVwiIF07IHRoZW5cbiAgcHJpbnRmICclc1xcbicgJzo6ZXJyb3I6OlZhdWx0IGRpZCBub3Qgc3VwcGx5IGEgdmFsdWUgZm9yIFBBWU1FTlRTX1ZBVUxUX1BST0JFLidcbiAgZXhpdCAxXG5maVxucHJpbnRmICclc1xcbicgJ1BBU1M6IEdpdEh1YiBBY3Rpb25zIHJlYWQgdGhlIGxpbmtlZCBWYXVsdCBzZWNyZXQgd2l0aG91dCBkaXNwbGF5aW5nIGl0LiciLCJpZCI6InN0ZXAtdmF1bHQtY2hlY2siLCJuYW1lIjoiVmVyaWZ5IFZhdWx0IHN1cHBsaWVkIHRoZSB0ZXN0IHZhbHVlIiwic3RlcElkIjoiIiwidXBsb2FkQXJ0aWZhY3QiOmZhbHNlfV0sInRpbWVvdXRNaW51dGVzIjoxLCJ0b29sIjoic2hlbGwiLCJ3b3JraW5nRGlyZWN0b3J5IjoiLiJ9XSwiZGVwbG95bWVudHMiOlt7ImFkdmFuY2VkQ29uZGl0aW9uIjoiJHt7IGZhbHNlIH19IiwiYXBwcm92YWwiOnsiYXBwcm92ZXJHcm91cCI6IiIsInJlcXVpcmVkIjpmYWxzZX0sImVudmlyb25tZW50VXJsIjoiIiwiaWQiOiJkZXBsb3ltZW50LXZhdWx0LXN0YWdpbmciLCJpbWFnZUlkcyI6WyJpbWFnZS12YXVsdC1jaGVjayJdLCJpbmZyYXN0cnVjdHVyZSI6Imt1YmVybmV0ZXMiLCJuYW1lIjoic3RhZ2luZyIsInJlZ2lvbiI6IiIsInJ1bkNvbmRpdGlvbiI6Im1hbnVhbCIsInN0ZXBzIjpbeyJjb21tYW5kIjoiZWNobyAnU3RhZ2luZyBpcyBza2lwcGVkIGZvciB0aGlzIFZhdWx0IGNoZWNrLiciLCJpZCI6InN0YWdlLXZhdWx0LXNtb2tlIiwibmFtZSI6IktlZXAgc3RhZ2luZyB1bmNoYW5nZWQifV0sInN0cmF0ZWd5Ijoicm9sbGluZyJ9XSwiZGVzY3JpcHRpb24iOiJNYW51YWwgVmF1bHQgcmVhZCBjaGVjayBmb3IgUGF5bWVudHMuIFRoZSBpbWFnZSBhbmQgc3RhZ2luZyBqb2JzIHN0YXkgc2tpcHBlZC4iLCJlbnZpcm9ubWVudFZhcmlhYmxlcyI6W3siaWQiOiJ2YXItdmF1bHQtcHJvYmUiLCJuYW1lIjoiUEFZTUVOVFNfVkFVTFRfUFJPQkUiLCJzY29wZSI6ImJ1aWxkSm9iIiwic2NvcGVJZCI6ImpvYi12YXVsdC1jaGVjayIsInNlY3JldCI6dHJ1ZSwidmFsdWUiOiIiLCJ2YXVsdFJlZiI6InNlY3JldC9waWljby9jMzBhMGQzYi0xYzJlLTQ5NGMtYjkyNi0yZGJkMGNhZjIzZGIvc3RhZ2luZy8wZTk5YWQyOC0yNWM4LTRiMDktOWNmZi1lY2U1MjNmMmRiNzAifV0sImltYWdlcyI6W3siYmFzZUltYWdlIjoic2NyYXRjaCIsImJ1aWxkSm9iSWQiOiJqb2ItdmF1bHQtY2hlY2siLCJkb2NrZXJmaWxlUGF0aCI6Ii4vRG9ja2VyZmlsZSIsImdpdGh1YkFjdGlvbnNDb25kaXRpb24iOiIke3sgZmFsc2UgfX0iLCJpZCI6ImltYWdlLXZhdWx0LWNoZWNrIiwibmFtZSI6InZhdWx0LXNtb2tlIiwidGFncyI6WyJzbW9rZSJdfV0sImludGVncmF0aW9ucyI6W10sIm5hbWUiOiJ2YXVsdC1zbW9rZS10ZXN0IiwicmF3UGFzc3Rocm91Z2giOltdLCJyZXBvc2l0b3JpZXMiOnsiYWRkaXRpb25hbCI6W10sInByaW1hcnkiOnsiYnJhbmNoUGF0dGVybiI6Im1haW4iLCJjb25jdXJyZW5jeSI6eyJjYW5jZWxJblByb2dyZXNzIjp0cnVlLCJlbmFibGVkIjpmYWxzZSwiZ3JvdXAiOiIifSwiaWQiOiJyZXBvLXByaW1hcnkiLCJtYW51YWxJbnB1dHMiOltdLCJtYW51YWxUcmlnZ2VyIjp0cnVlLCJwYXRoIjoic3JpaGFyaS05NzYvcGF5bWVudHMtYXBpIiwicGF0aEZpbHRlciI6IiIsInByb3ZpZGVyIjoiR2l0SHViIiwicmVmIjoibWFpbiIsInRhZ1BhdHRlcm4iOiIiLCJ0cmlnZ2VyTW9kZSI6Im1hbnVhbCJ9fSwic2VjdXJpdHkiOnsiZXZpZGVuY2VCdW5kbGUiOnsiZW5hYmxlZCI6ZmFsc2UsIm91dHB1dHMiOnsiYXJ0aWZhY3QiOnRydWUsImpvYlN1bW1hcnkiOnRydWUsInByQ29tbWVudCI6ZmFsc2V9fSwiZ2F0ZU1vZGUiOiJlbmZvcmNlIiwiaW1hZ2VTaWduaW5nIjp7ImVuYWJsZWQiOmZhbHNlLCJtZXRob2QiOiJrZXlsZXNzLW9pZGMifSwibGljZW5zZVBvbGljeSI6Im9yZ2FuaXphdGlvbi1kZWZhdWx0Iiwic2JvbSI6eyJlbmFibGVkIjpmYWxzZSwiZm9ybWF0IjoiY3ljbG9uZWR4In19fQ==
-# Piπco body sha256: e45420ba267eddfd91d2cdce1c06456abe704bafa0f9b3d59a74f441912f3a3b
+# Piπco canonical snapshot v1: eyJhcnRpZmFjdFJlcG9zaXRvcnkiOnsidHlwZSI6ImdpdGh1Yi1wYWNrYWdlcyIsInVybCI6IiIsInZlcnNpb25pbmdTdHJhdGVneSI6ImNvbW1pdC1zaGEifSwiYnVpbGRKb2JzIjpbeyJjYWNoZSI6eyJlbmFibGVkIjp0cnVlLCJrZXkiOiIifSwiaWQiOiJwcmVwYXJlLXNtb2tlIiwibWF0cml4Ijp7ImVuYWJsZWQiOmZhbHNlLCJmYWlsRmFzdCI6dHJ1ZSwidmFsdWVzIjpbXSwidmFyaWFibGUiOiIifSwibmFtZSI6IlByZXBhcmUgc21va2Ugd2Vic2l0ZSIsIm91dHB1dHMiOltdLCJydW50aW1lIjoiYmFzaCIsInN0ZXBzIjpbeyJhcnRpZmFjdE5hbWUiOiJ2YXVsdC1zbW9rZS1jb250ZXh0IiwiYXJ0aWZhY3RQYXRoIjoic21va2Utc2l0ZSIsImNvbW1hbmQiOiJzZXQgLWV1XG5zZXQgK3hcbnB5dGhvbjMgLSA8PCdQWSdcbmltcG9ydCBvc1xuaW1wb3J0IHN5c1xubmFtZXMgPSBvcy5lbnZpcm9uLmdldChcIlBJSUNPX1ZBVUxUX1JFU09MVkVEXCIsIFwiXCIpLnNwbGl0KFwiLFwiKVxuaWYgXCJQQVlNRU5UU19WQVVMVF9QUk9CRVwiIG5vdCBpbiBuYW1lcyBvciBub3Qgb3MuZW52aXJvbi5nZXQoXCJQQVlNRU5UU19WQVVMVF9QUk9CRVwiKTpcbiAgICBzeXMuZXhpdChcIlZhdWx0IGRpZCBub3QgcmVzb2x2ZSB0aGUgbGlua2VkIHNtb2tlIHByb2JlLlwiKVxucHJpbnQoXCJQQVNTOiBWYXVsdCBzdXBwbGllZCB0aGUgc21va2UgcHJvYmU7IGl0cyB2YWx1ZSB3YXMgbm90IGRpc3BsYXllZC5cIilcblBZXG5ta2RpciAtcCBzbW9rZS1zaXRlXG5jYXQgPiBzbW9rZS1zaXRlL2luZGV4Lmh0bWwgPDwnSFRNTCdcbjwhZG9jdHlwZSBodG1sPlxuPGh0bWwgbGFuZz1cImVuXCI+XG48aGVhZD48bWV0YSBjaGFyc2V0PVwidXRmLThcIj48bWV0YSBuYW1lPVwidmlld3BvcnRcIiBjb250ZW50PVwid2lkdGg9ZGV2aWNlLXdpZHRoLCBpbml0aWFsLXNjYWxlPTFcIj5cbjx0aXRsZT5Qac+AY28gZW52aXJvbm1lbnQgc21va2UgdGVzdDwvdGl0bGU+XG48c3R5bGU+Ym9keXttYXJnaW46MDtwYWRkaW5nOjRyZW0gMS41cmVtO2JhY2tncm91bmQ6I2Y0ZjVmYztjb2xvcjojMTAyYjY4O2ZvbnQ6MThweC8xLjYgc3lzdGVtLXVpfW1haW57bWF4LXdpZHRoOjQycmVtO21hcmdpbjphdXRvO3BhZGRpbmc6MnJlbTtiYWNrZ3JvdW5kOndoaXRlO2JvcmRlci1yYWRpdXM6MjBweDtib3JkZXItdG9wOjZweCBzb2xpZCAjN2IzZmU0fWF7Y29sb3I6I2E2MDA1Yn08L3N0eWxlPlxuPC9oZWFkPjxib2R5PjxtYWluIGRhdGEtcGlwZWxpbmU9XCJ2YXVsdC1zbW9rZS10ZXN0XCI+PGgxPlBpz4BjbyBtdWx0aS1lbnZpcm9ubWVudCBkZW1vPC9oMT5cbjxwPk9uZSBjb250YWluZXIgaW1hZ2UgaXMgcHJvbW90ZWQgdGhyb3VnaCBERVYsIFRFU1QgYW5kIFNUQUdJTkcuPC9wPlxuPHA+VmF1bHQgc2VjcmV0cyBhcmUgY2hlY2tlZCBhdCBydW50aW1lIGFuZCBhcmUgbmV2ZXIgd3JpdHRlbiBpbnRvIHRoaXMgcGFnZSBvciBpbWFnZS48L3A+XG48YSBocmVmPVwiL2hlYWx0aC5qc29uXCI+RW52aXJvbm1lbnQgaGVhbHRoIGNoZWNrPC9hPjwvbWFpbj48L2JvZHk+PC9odG1sPlxuSFRNTFxuY2F0ID4gc21va2Utc2l0ZS9Eb2NrZXJmaWxlIDw8J0RPQ0tFUkZJTEUnXG5GUk9NIG5naW54OmFscGluZVxuQ09QWSBpbmRleC5odG1sIC91c3Ivc2hhcmUvbmdpbngvaHRtbC9pbmRleC5odG1sXG5ET0NLRVJGSUxFXG50ZXN0IC1zIHNtb2tlLXNpdGUvaW5kZXguaHRtbFxuIiwiaWQiOiJwcmVwYXJlLXNpdGUiLCJuYW1lIjoiVmVyaWZ5IFZhdWx0IGFuZCBwcmVwYXJlIEhUTUwiLCJzdGVwSWQiOiIiLCJ1cGxvYWRBcnRpZmFjdCI6dHJ1ZX1dLCJ0aW1lb3V0TWludXRlcyI6MywidG9vbCI6InNoZWxsIiwid29ya2luZ0RpcmVjdG9yeSI6Ii4ifV0sImRlcGxveW1lbnRzIjpbeyJhZHZhbmNlZENvbmRpdGlvbiI6IiIsImFwcHJvdmFsIjp7ImFwcHJvdmVyR3JvdXAiOiIiLCJyZXF1aXJlZCI6ZmFsc2V9LCJkZXBlbmRzT24iOltdLCJkZXNjcmlwdGlvbiI6IkVwaGVtZXJhbCBEb2NrZXIgZGVwbG95bWVudCBvbiB0aGUgR2l0SHViIEFjdGlvbnMgcnVubmVyLiIsImVudmlyb25tZW50SWQiOiJlbnYtZGV2IiwiZW52aXJvbm1lbnRVcmwiOiIiLCJpZCI6ImRlcGxveS1kZXYiLCJpbWFnZUlkcyI6WyJzbW9rZS1pbWFnZSJdLCJpbmZyYXN0cnVjdHVyZSI6ImRvY2tlciIsIm5hbWUiOiJkZXYiLCJyZWdpb24iOiIiLCJydW5Db25kaXRpb24iOiJtYW51YWwiLCJzdGVwcyI6W3siY29tbWFuZCI6InNldCAtZXVcbnNldCAreFxucHl0aG9uMyAtIDw8J1BZJ1xuaW1wb3J0IG9zXG5pbXBvcnQgc3lzXG5uYW1lcyA9IG9zLmVudmlyb24uZ2V0KFwiUElJQ09fVkFVTFRfUkVTT0xWRURcIiwgXCJcIikuc3BsaXQoXCIsXCIpXG5pZiBcIlBBWU1FTlRTX1ZBVUxUX1BST0JFXCIgbm90IGluIG5hbWVzIG9yIG5vdCBvcy5lbnZpcm9uLmdldChcIlBBWU1FTlRTX1ZBVUxUX1BST0JFXCIpOlxuICAgIHN5cy5leGl0KFwiVmF1bHQgZGlkIG5vdCByZXNvbHZlIHRoZSBsaW5rZWQgc21va2UgcHJvYmUuXCIpXG5wcmludChcIlBBU1M6IFZhdWx0IHN1cHBsaWVkIHRoZSBzbW9rZSBwcm9iZTsgaXRzIHZhbHVlIHdhcyBub3QgZGlzcGxheWVkLlwiKVxuUFlcbnB5dGhvbjMgLSA8PCdQWSdcbmltcG9ydCBvc1xuaW1wb3J0IHN5c1xuZXhwZWN0ZWQgPSBvcy5lbnZpcm9uW1wiRVhQRUNURURfRU5WXCJdXG5pZiBvcy5lbnZpcm9uLmdldChcIkFQUF9FTlZcIikgIT0gZXhwZWN0ZWQ6XG4gICAgc3lzLmV4aXQoXCJUaGUgZGVwbG95bWVudCByZWNlaXZlZCBhbm90aGVyIGVudmlyb25tZW50J3MgY29uZmlndXJhdGlvbi5cIilcbmlmIG9zLmVudmlyb24uZ2V0KFwiRU5WX01FU1NBR0VcIikgIT0gZlwie2V4cGVjdGVkLnVwcGVyKCl9IGVudmlyb25tZW50IGNvbmZpZ3VyYXRpb24gbG9hZGVkXCI6XG4gICAgc3lzLmV4aXQoXCJUaGUgZW52aXJvbm1lbnQtc3BlY2lmaWMgbWVzc2FnZSB3YXMgbm90IGFwcGxpZWQuXCIpXG5QWVxuY29udGFpbmVyPVwicGlpY28tJHtBUFBfRU5WfS0ke0dJVEhVQl9SVU5fSUR9LSR7R0lUSFVCX1JVTl9BVFRFTVBUfVwiXG50cmFwICdkb2NrZXIgcm0gLWYgXCIkY29udGFpbmVyXCIgPi9kZXYvbnVsbCAyPiYxIHx8IHRydWUnIEVYSVRcbmRvY2tlciBydW4gLS1wdWxsPW5ldmVyIC0tZGV0YWNoIC0tbmFtZSBcIiRjb250YWluZXJcIiAtLXB1Ymxpc2ggMTI3LjAuMC4xOjo4MCBcIiRTTU9LRV9JTUFHRVwiXG5lbmRwb2ludD1cImh0dHA6Ly8kKGRvY2tlciBwb3J0IFwiJGNvbnRhaW5lclwiIDgwL3RjcCB8IGhlYWQgLW4gMSlcIlxuY3VybCAtLWZhaWwgLS1zaWxlbnQgLS1zaG93LWVycm9yIC0tcmV0cnkgOCAtLXJldHJ5LWNvbm5yZWZ1c2VkIC0tcmV0cnktZGVsYXkgMSAtLW1heC10aW1lIDQgXCIkZW5kcG9pbnQvXCIgPiBcIiRSVU5ORVJfVEVNUC9waWljby1zbW9rZS1wYWdlLmh0bWxcIlxuZ3JlcCAtcSAnZGF0YS1waXBlbGluZT1cInZhdWx0LXNtb2tlLXRlc3RcIicgXCIkUlVOTkVSX1RFTVAvcGlpY28tc21va2UtcGFnZS5odG1sXCJcbnB5dGhvbjMgLSA8PCdQWSdcbmltcG9ydCBqc29uXG5pbXBvcnQgb3NcbmZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aFxuZGF0YSA9IHtcImVudmlyb25tZW50XCI6IG9zLmVudmlyb25bXCJBUFBfRU5WXCJdLCBcIm1lc3NhZ2VcIjogb3MuZW52aXJvbltcIkVOVl9NRVNTQUdFXCJdLCBcInZhdWx0X3ZlcmlmaWVkXCI6IFRydWV9XG5QYXRoKG9zLmVudmlyb25bXCJSVU5ORVJfVEVNUFwiXSwgXCJwaWljby1zbW9rZS1oZWFsdGguanNvblwiKS53cml0ZV90ZXh0KGpzb24uZHVtcHMoZGF0YSksIGVuY29kaW5nPVwidXRmLThcIilcblBZXG5kb2NrZXIgY3AgXCIkUlVOTkVSX1RFTVAvcGlpY28tc21va2UtaGVhbHRoLmpzb25cIiBcIiRjb250YWluZXI6L3Vzci9zaGFyZS9uZ2lueC9odG1sL2hlYWx0aC5qc29uXCJcbmN1cmwgLS1mYWlsIC0tc2lsZW50IC0tc2hvdy1lcnJvciAtLXJldHJ5IDMgLS1yZXRyeS1jb25ucmVmdXNlZCAtLXJldHJ5LWRlbGF5IDEgLS1tYXgtdGltZSA0IFwiJGVuZHBvaW50L2hlYWx0aC5qc29uXCIgPiBcIiRSVU5ORVJfVEVNUC9waWljby1zbW9rZS1yZXNwb25zZS5qc29uXCJcbnB5dGhvbjMgLSA8PCdQWSdcbmltcG9ydCBqc29uXG5pbXBvcnQgb3NcbmZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aFxucmVzdWx0ID0ganNvbi5sb2FkcyhQYXRoKG9zLmVudmlyb25bXCJSVU5ORVJfVEVNUFwiXSwgXCJwaWljby1zbW9rZS1yZXNwb25zZS5qc29uXCIpLnJlYWRfdGV4dChlbmNvZGluZz1cInV0Zi04XCIpKVxuYXNzZXJ0IHJlc3VsdFtcImVudmlyb25tZW50XCJdID09IG9zLmVudmlyb25bXCJFWFBFQ1RFRF9FTlZcIl0sIFwiSFRUUCBlbnZpcm9ubWVudCBkb2VzIG5vdCBtYXRjaCB0aGUgZGVwbG95bWVudFwiXG5hc3NlcnQgcmVzdWx0W1widmF1bHRfdmVyaWZpZWRcIl0gaXMgVHJ1ZSwgXCJWYXVsdCBjaGVjayB3YXMgbm90IHJlY29yZGVkXCJcbnByaW50KFwiUEFTUzogSFRNTCBhbmQgSFRUUCBoZWFsdGggY2hlY2tzIHBhc3NlZCBmb3IgXCIgKyByZXN1bHRbXCJlbnZpcm9ubWVudFwiXS51cHBlcigpKVxuUFlcbmltYWdlX2lkPVwiJChkb2NrZXIgaW1hZ2UgaW5zcGVjdCBcIiRTTU9LRV9JTUFHRVwiIC0tZm9ybWF0ICd7ey5JZH19JylcIlxucHJpbnRmICcjIyMgJXMgcGFzc2VkXFxuXFxuLSBWYXVsdCBwcm9iZSByZXNvbHZlZCB3aXRob3V0IGV4cG9zaW5nIGl0cyB2YWx1ZS5cXG4tIEVudmlyb25tZW50IHZhcmlhYmxlcyBtYXRjaGVkIHRoaXMgam9iLlxcbi0gSFRNTCBhbmQgaGVhbHRoIGVuZHBvaW50IHJldHVybmVkIEhUVFAgMjAwLlxcbi0gUHJvbW90ZWQgaW1hZ2U6IGAlc2BcXG4tIFRlc3QgY29udGFpbmVyIHdhcyByZW1vdmVkIGF0IGpvYiBleGl0LlxcbicgXCIkQVBQX0VOVlwiIFwiJGltYWdlX2lkXCIgPj4gXCIkR0lUSFVCX1NURVBfU1VNTUFSWVwiXG4iLCJpZCI6ImRldi12ZXJpZnkiLCJuYW1lIjoiVmVyaWZ5IFZhdWx0IGFuZCBzZXJ2ZSBERVYgSFRNTCJ9XSwic3RyYXRlZ3kiOiJyb2xsaW5nIn0seyJhZHZhbmNlZENvbmRpdGlvbiI6IiIsImFwcHJvdmFsIjp7ImFwcHJvdmVyR3JvdXAiOiIiLCJyZXF1aXJlZCI6ZmFsc2V9LCJkZXBlbmRzT24iOlsiZGVwbG95LWRldiJdLCJkZXNjcmlwdGlvbiI6IkVwaGVtZXJhbCBEb2NrZXIgZGVwbG95bWVudCBvbiB0aGUgR2l0SHViIEFjdGlvbnMgcnVubmVyLiIsImVudmlyb25tZW50SWQiOiJlbnYtdGVzdCIsImVudmlyb25tZW50VXJsIjoiIiwiaWQiOiJkZXBsb3ktdGVzdCIsImltYWdlSWRzIjpbInNtb2tlLWltYWdlIl0sImluZnJhc3RydWN0dXJlIjoiZG9ja2VyIiwibmFtZSI6InRlc3QiLCJyZWdpb24iOiIiLCJydW5Db25kaXRpb24iOiJtYW51YWwiLCJzdGVwcyI6W3siY29tbWFuZCI6InNldCAtZXVcbnNldCAreFxucHl0aG9uMyAtIDw8J1BZJ1xuaW1wb3J0IG9zXG5pbXBvcnQgc3lzXG5uYW1lcyA9IG9zLmVudmlyb24uZ2V0KFwiUElJQ09fVkFVTFRfUkVTT0xWRURcIiwgXCJcIikuc3BsaXQoXCIsXCIpXG5pZiBcIlBBWU1FTlRTX1ZBVUxUX1BST0JFXCIgbm90IGluIG5hbWVzIG9yIG5vdCBvcy5lbnZpcm9uLmdldChcIlBBWU1FTlRTX1ZBVUxUX1BST0JFXCIpOlxuICAgIHN5cy5leGl0KFwiVmF1bHQgZGlkIG5vdCByZXNvbHZlIHRoZSBsaW5rZWQgc21va2UgcHJvYmUuXCIpXG5wcmludChcIlBBU1M6IFZhdWx0IHN1cHBsaWVkIHRoZSBzbW9rZSBwcm9iZTsgaXRzIHZhbHVlIHdhcyBub3QgZGlzcGxheWVkLlwiKVxuUFlcbnB5dGhvbjMgLSA8PCdQWSdcbmltcG9ydCBvc1xuaW1wb3J0IHN5c1xuZXhwZWN0ZWQgPSBvcy5lbnZpcm9uW1wiRVhQRUNURURfRU5WXCJdXG5pZiBvcy5lbnZpcm9uLmdldChcIkFQUF9FTlZcIikgIT0gZXhwZWN0ZWQ6XG4gICAgc3lzLmV4aXQoXCJUaGUgZGVwbG95bWVudCByZWNlaXZlZCBhbm90aGVyIGVudmlyb25tZW50J3MgY29uZmlndXJhdGlvbi5cIilcbmlmIG9zLmVudmlyb24uZ2V0KFwiRU5WX01FU1NBR0VcIikgIT0gZlwie2V4cGVjdGVkLnVwcGVyKCl9IGVudmlyb25tZW50IGNvbmZpZ3VyYXRpb24gbG9hZGVkXCI6XG4gICAgc3lzLmV4aXQoXCJUaGUgZW52aXJvbm1lbnQtc3BlY2lmaWMgbWVzc2FnZSB3YXMgbm90IGFwcGxpZWQuXCIpXG5QWVxuY29udGFpbmVyPVwicGlpY28tJHtBUFBfRU5WfS0ke0dJVEhVQl9SVU5fSUR9LSR7R0lUSFVCX1JVTl9BVFRFTVBUfVwiXG50cmFwICdkb2NrZXIgcm0gLWYgXCIkY29udGFpbmVyXCIgPi9kZXYvbnVsbCAyPiYxIHx8IHRydWUnIEVYSVRcbmRvY2tlciBydW4gLS1wdWxsPW5ldmVyIC0tZGV0YWNoIC0tbmFtZSBcIiRjb250YWluZXJcIiAtLXB1Ymxpc2ggMTI3LjAuMC4xOjo4MCBcIiRTTU9LRV9JTUFHRVwiXG5lbmRwb2ludD1cImh0dHA6Ly8kKGRvY2tlciBwb3J0IFwiJGNvbnRhaW5lclwiIDgwL3RjcCB8IGhlYWQgLW4gMSlcIlxuY3VybCAtLWZhaWwgLS1zaWxlbnQgLS1zaG93LWVycm9yIC0tcmV0cnkgOCAtLXJldHJ5LWNvbm5yZWZ1c2VkIC0tcmV0cnktZGVsYXkgMSAtLW1heC10aW1lIDQgXCIkZW5kcG9pbnQvXCIgPiBcIiRSVU5ORVJfVEVNUC9waWljby1zbW9rZS1wYWdlLmh0bWxcIlxuZ3JlcCAtcSAnZGF0YS1waXBlbGluZT1cInZhdWx0LXNtb2tlLXRlc3RcIicgXCIkUlVOTkVSX1RFTVAvcGlpY28tc21va2UtcGFnZS5odG1sXCJcbnB5dGhvbjMgLSA8PCdQWSdcbmltcG9ydCBqc29uXG5pbXBvcnQgb3NcbmZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aFxuZGF0YSA9IHtcImVudmlyb25tZW50XCI6IG9zLmVudmlyb25bXCJBUFBfRU5WXCJdLCBcIm1lc3NhZ2VcIjogb3MuZW52aXJvbltcIkVOVl9NRVNTQUdFXCJdLCBcInZhdWx0X3ZlcmlmaWVkXCI6IFRydWV9XG5QYXRoKG9zLmVudmlyb25bXCJSVU5ORVJfVEVNUFwiXSwgXCJwaWljby1zbW9rZS1oZWFsdGguanNvblwiKS53cml0ZV90ZXh0KGpzb24uZHVtcHMoZGF0YSksIGVuY29kaW5nPVwidXRmLThcIilcblBZXG5kb2NrZXIgY3AgXCIkUlVOTkVSX1RFTVAvcGlpY28tc21va2UtaGVhbHRoLmpzb25cIiBcIiRjb250YWluZXI6L3Vzci9zaGFyZS9uZ2lueC9odG1sL2hlYWx0aC5qc29uXCJcbmN1cmwgLS1mYWlsIC0tc2lsZW50IC0tc2hvdy1lcnJvciAtLXJldHJ5IDMgLS1yZXRyeS1jb25ucmVmdXNlZCAtLXJldHJ5LWRlbGF5IDEgLS1tYXgtdGltZSA0IFwiJGVuZHBvaW50L2hlYWx0aC5qc29uXCIgPiBcIiRSVU5ORVJfVEVNUC9waWljby1zbW9rZS1yZXNwb25zZS5qc29uXCJcbnB5dGhvbjMgLSA8PCdQWSdcbmltcG9ydCBqc29uXG5pbXBvcnQgb3NcbmZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aFxucmVzdWx0ID0ganNvbi5sb2FkcyhQYXRoKG9zLmVudmlyb25bXCJSVU5ORVJfVEVNUFwiXSwgXCJwaWljby1zbW9rZS1yZXNwb25zZS5qc29uXCIpLnJlYWRfdGV4dChlbmNvZGluZz1cInV0Zi04XCIpKVxuYXNzZXJ0IHJlc3VsdFtcImVudmlyb25tZW50XCJdID09IG9zLmVudmlyb25bXCJFWFBFQ1RFRF9FTlZcIl0sIFwiSFRUUCBlbnZpcm9ubWVudCBkb2VzIG5vdCBtYXRjaCB0aGUgZGVwbG95bWVudFwiXG5hc3NlcnQgcmVzdWx0W1widmF1bHRfdmVyaWZpZWRcIl0gaXMgVHJ1ZSwgXCJWYXVsdCBjaGVjayB3YXMgbm90IHJlY29yZGVkXCJcbnByaW50KFwiUEFTUzogSFRNTCBhbmQgSFRUUCBoZWFsdGggY2hlY2tzIHBhc3NlZCBmb3IgXCIgKyByZXN1bHRbXCJlbnZpcm9ubWVudFwiXS51cHBlcigpKVxuUFlcbmltYWdlX2lkPVwiJChkb2NrZXIgaW1hZ2UgaW5zcGVjdCBcIiRTTU9LRV9JTUFHRVwiIC0tZm9ybWF0ICd7ey5JZH19JylcIlxucHJpbnRmICcjIyMgJXMgcGFzc2VkXFxuXFxuLSBWYXVsdCBwcm9iZSByZXNvbHZlZCB3aXRob3V0IGV4cG9zaW5nIGl0cyB2YWx1ZS5cXG4tIEVudmlyb25tZW50IHZhcmlhYmxlcyBtYXRjaGVkIHRoaXMgam9iLlxcbi0gSFRNTCBhbmQgaGVhbHRoIGVuZHBvaW50IHJldHVybmVkIEhUVFAgMjAwLlxcbi0gUHJvbW90ZWQgaW1hZ2U6IGAlc2BcXG4tIFRlc3QgY29udGFpbmVyIHdhcyByZW1vdmVkIGF0IGpvYiBleGl0LlxcbicgXCIkQVBQX0VOVlwiIFwiJGltYWdlX2lkXCIgPj4gXCIkR0lUSFVCX1NURVBfU1VNTUFSWVwiXG4iLCJpZCI6InRlc3QtdmVyaWZ5IiwibmFtZSI6IlZlcmlmeSBWYXVsdCBhbmQgc2VydmUgVEVTVCBIVE1MIn1dLCJzdHJhdGVneSI6InJvbGxpbmcifSx7ImFkdmFuY2VkQ29uZGl0aW9uIjoiIiwiYXBwcm92YWwiOnsiYXBwcm92ZXJHcm91cCI6IiIsInJlcXVpcmVkIjpmYWxzZX0sImRlcGVuZHNPbiI6WyJkZXBsb3ktdGVzdCJdLCJkZXNjcmlwdGlvbiI6IkVwaGVtZXJhbCBEb2NrZXIgZGVwbG95bWVudCBvbiB0aGUgR2l0SHViIEFjdGlvbnMgcnVubmVyLiIsImVudmlyb25tZW50SWQiOiJlbnYtc3RhZ2luZyIsImVudmlyb25tZW50VXJsIjoiIiwiaWQiOiJkZXBsb3ktc3RhZ2luZyIsImltYWdlSWRzIjpbInNtb2tlLWltYWdlIl0sImluZnJhc3RydWN0dXJlIjoiZG9ja2VyIiwibmFtZSI6InN0YWdpbmciLCJyZWdpb24iOiIiLCJydW5Db25kaXRpb24iOiJtYW51YWwiLCJzdGVwcyI6W3siY29tbWFuZCI6InNldCAtZXVcbnNldCAreFxucHl0aG9uMyAtIDw8J1BZJ1xuaW1wb3J0IG9zXG5pbXBvcnQgc3lzXG5uYW1lcyA9IG9zLmVudmlyb24uZ2V0KFwiUElJQ09fVkFVTFRfUkVTT0xWRURcIiwgXCJcIikuc3BsaXQoXCIsXCIpXG5pZiBcIlBBWU1FTlRTX1ZBVUxUX1BST0JFXCIgbm90IGluIG5hbWVzIG9yIG5vdCBvcy5lbnZpcm9uLmdldChcIlBBWU1FTlRTX1ZBVUxUX1BST0JFXCIpOlxuICAgIHN5cy5leGl0KFwiVmF1bHQgZGlkIG5vdCByZXNvbHZlIHRoZSBsaW5rZWQgc21va2UgcHJvYmUuXCIpXG5wcmludChcIlBBU1M6IFZhdWx0IHN1cHBsaWVkIHRoZSBzbW9rZSBwcm9iZTsgaXRzIHZhbHVlIHdhcyBub3QgZGlzcGxheWVkLlwiKVxuUFlcbnB5dGhvbjMgLSA8PCdQWSdcbmltcG9ydCBvc1xuaW1wb3J0IHN5c1xuZXhwZWN0ZWQgPSBvcy5lbnZpcm9uW1wiRVhQRUNURURfRU5WXCJdXG5pZiBvcy5lbnZpcm9uLmdldChcIkFQUF9FTlZcIikgIT0gZXhwZWN0ZWQ6XG4gICAgc3lzLmV4aXQoXCJUaGUgZGVwbG95bWVudCByZWNlaXZlZCBhbm90aGVyIGVudmlyb25tZW50J3MgY29uZmlndXJhdGlvbi5cIilcbmlmIG9zLmVudmlyb24uZ2V0KFwiRU5WX01FU1NBR0VcIikgIT0gZlwie2V4cGVjdGVkLnVwcGVyKCl9IGVudmlyb25tZW50IGNvbmZpZ3VyYXRpb24gbG9hZGVkXCI6XG4gICAgc3lzLmV4aXQoXCJUaGUgZW52aXJvbm1lbnQtc3BlY2lmaWMgbWVzc2FnZSB3YXMgbm90IGFwcGxpZWQuXCIpXG5QWVxuY29udGFpbmVyPVwicGlpY28tJHtBUFBfRU5WfS0ke0dJVEhVQl9SVU5fSUR9LSR7R0lUSFVCX1JVTl9BVFRFTVBUfVwiXG50cmFwICdkb2NrZXIgcm0gLWYgXCIkY29udGFpbmVyXCIgPi9kZXYvbnVsbCAyPiYxIHx8IHRydWUnIEVYSVRcbmRvY2tlciBydW4gLS1wdWxsPW5ldmVyIC0tZGV0YWNoIC0tbmFtZSBcIiRjb250YWluZXJcIiAtLXB1Ymxpc2ggMTI3LjAuMC4xOjo4MCBcIiRTTU9LRV9JTUFHRVwiXG5lbmRwb2ludD1cImh0dHA6Ly8kKGRvY2tlciBwb3J0IFwiJGNvbnRhaW5lclwiIDgwL3RjcCB8IGhlYWQgLW4gMSlcIlxuY3VybCAtLWZhaWwgLS1zaWxlbnQgLS1zaG93LWVycm9yIC0tcmV0cnkgOCAtLXJldHJ5LWNvbm5yZWZ1c2VkIC0tcmV0cnktZGVsYXkgMSAtLW1heC10aW1lIDQgXCIkZW5kcG9pbnQvXCIgPiBcIiRSVU5ORVJfVEVNUC9waWljby1zbW9rZS1wYWdlLmh0bWxcIlxuZ3JlcCAtcSAnZGF0YS1waXBlbGluZT1cInZhdWx0LXNtb2tlLXRlc3RcIicgXCIkUlVOTkVSX1RFTVAvcGlpY28tc21va2UtcGFnZS5odG1sXCJcbnB5dGhvbjMgLSA8PCdQWSdcbmltcG9ydCBqc29uXG5pbXBvcnQgb3NcbmZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aFxuZGF0YSA9IHtcImVudmlyb25tZW50XCI6IG9zLmVudmlyb25bXCJBUFBfRU5WXCJdLCBcIm1lc3NhZ2VcIjogb3MuZW52aXJvbltcIkVOVl9NRVNTQUdFXCJdLCBcInZhdWx0X3ZlcmlmaWVkXCI6IFRydWV9XG5QYXRoKG9zLmVudmlyb25bXCJSVU5ORVJfVEVNUFwiXSwgXCJwaWljby1zbW9rZS1oZWFsdGguanNvblwiKS53cml0ZV90ZXh0KGpzb24uZHVtcHMoZGF0YSksIGVuY29kaW5nPVwidXRmLThcIilcblBZXG5kb2NrZXIgY3AgXCIkUlVOTkVSX1RFTVAvcGlpY28tc21va2UtaGVhbHRoLmpzb25cIiBcIiRjb250YWluZXI6L3Vzci9zaGFyZS9uZ2lueC9odG1sL2hlYWx0aC5qc29uXCJcbmN1cmwgLS1mYWlsIC0tc2lsZW50IC0tc2hvdy1lcnJvciAtLXJldHJ5IDMgLS1yZXRyeS1jb25ucmVmdXNlZCAtLXJldHJ5LWRlbGF5IDEgLS1tYXgtdGltZSA0IFwiJGVuZHBvaW50L2hlYWx0aC5qc29uXCIgPiBcIiRSVU5ORVJfVEVNUC9waWljby1zbW9rZS1yZXNwb25zZS5qc29uXCJcbnB5dGhvbjMgLSA8PCdQWSdcbmltcG9ydCBqc29uXG5pbXBvcnQgb3NcbmZyb20gcGF0aGxpYiBpbXBvcnQgUGF0aFxucmVzdWx0ID0ganNvbi5sb2FkcyhQYXRoKG9zLmVudmlyb25bXCJSVU5ORVJfVEVNUFwiXSwgXCJwaWljby1zbW9rZS1yZXNwb25zZS5qc29uXCIpLnJlYWRfdGV4dChlbmNvZGluZz1cInV0Zi04XCIpKVxuYXNzZXJ0IHJlc3VsdFtcImVudmlyb25tZW50XCJdID09IG9zLmVudmlyb25bXCJFWFBFQ1RFRF9FTlZcIl0sIFwiSFRUUCBlbnZpcm9ubWVudCBkb2VzIG5vdCBtYXRjaCB0aGUgZGVwbG95bWVudFwiXG5hc3NlcnQgcmVzdWx0W1widmF1bHRfdmVyaWZpZWRcIl0gaXMgVHJ1ZSwgXCJWYXVsdCBjaGVjayB3YXMgbm90IHJlY29yZGVkXCJcbnByaW50KFwiUEFTUzogSFRNTCBhbmQgSFRUUCBoZWFsdGggY2hlY2tzIHBhc3NlZCBmb3IgXCIgKyByZXN1bHRbXCJlbnZpcm9ubWVudFwiXS51cHBlcigpKVxuUFlcbmltYWdlX2lkPVwiJChkb2NrZXIgaW1hZ2UgaW5zcGVjdCBcIiRTTU9LRV9JTUFHRVwiIC0tZm9ybWF0ICd7ey5JZH19JylcIlxucHJpbnRmICcjIyMgJXMgcGFzc2VkXFxuXFxuLSBWYXVsdCBwcm9iZSByZXNvbHZlZCB3aXRob3V0IGV4cG9zaW5nIGl0cyB2YWx1ZS5cXG4tIEVudmlyb25tZW50IHZhcmlhYmxlcyBtYXRjaGVkIHRoaXMgam9iLlxcbi0gSFRNTCBhbmQgaGVhbHRoIGVuZHBvaW50IHJldHVybmVkIEhUVFAgMjAwLlxcbi0gUHJvbW90ZWQgaW1hZ2U6IGAlc2BcXG4tIFRlc3QgY29udGFpbmVyIHdhcyByZW1vdmVkIGF0IGpvYiBleGl0LlxcbicgXCIkQVBQX0VOVlwiIFwiJGltYWdlX2lkXCIgPj4gXCIkR0lUSFVCX1NURVBfU1VNTUFSWVwiXG4iLCJpZCI6InN0YWdpbmctdmVyaWZ5IiwibmFtZSI6IlZlcmlmeSBWYXVsdCBhbmQgc2VydmUgU1RBR0lORyBIVE1MIn1dLCJzdHJhdGVneSI6InJvbGxpbmcifV0sImRlc2NyaXB0aW9uIjoiQnVpbGQgb25jZSwgdGhlbiB2ZXJpZnkgdGhlIHNhbWUgaW1hZ2UgYW5kIGEgc2hhcmVkIGF1dGhvcml6ZWQgVmF1bHQgcHJvYmUgdGhyb3VnaCBERVYg4oaSIFRFU1Qg4oaSIFNUQUdJTkcuIE5vIHJlZ2lzdHJ5IHB1c2ggb3IgcGVybWFuZW50IGhvc3RpbmcuIiwiZW52aXJvbm1lbnRWYXJpYWJsZXMiOlt7ImlkIjoiYXBwLW5hbWUiLCJuYW1lIjoiQVBQX05BTUUiLCJzY29wZSI6Imdsb2JhbCIsInNjb3BlSWQiOm51bGwsInNlY3JldCI6ZmFsc2UsInZhbHVlIjoidmF1bHQtc21va2UtdGVzdCJ9LHsiaWQiOiJzbW9rZS1pbWFnZSIsIm5hbWUiOiJTTU9LRV9JTUFHRSIsInNjb3BlIjoiZ2xvYmFsIiwic2NvcGVJZCI6bnVsbCwic2VjcmV0IjpmYWxzZSwidmFsdWUiOiJwaWljby12YXVsdC1zbW9rZTpkZW1vIn0seyJpZCI6ImJ1aWxkLXByb2JlIiwibmFtZSI6IlBBWU1FTlRTX1ZBVUxUX1BST0JFIiwic2NvcGUiOiJidWlsZEpvYiIsInNjb3BlSWQiOiJwcmVwYXJlLXNtb2tlIiwic2VjcmV0Ijp0cnVlLCJ2YWx1ZSI6IiIsInZhdWx0UmVmIjoic2VjcmV0L3BpaWNvL2MzMGEwZDNiLTFjMmUtNDk0Yy1iOTI2LTJkYmQwY2FmMjNkYi9zdGFnaW5nLzBlOTlhZDI4LTI1YzgtNGIwOS05Y2ZmLWVjZTUyM2YyZGI3MCJ9LHsiaWQiOiJkZXYtYXBwLWVudiIsIm5hbWUiOiJBUFBfRU5WIiwic2NvcGUiOiJlbnZpcm9ubWVudCIsInNjb3BlSWQiOiJlbnYtZGV2Iiwic2VjcmV0IjpmYWxzZSwidmFsdWUiOiJkZXYifSx7ImlkIjoiZGV2LW1lc3NhZ2UiLCJuYW1lIjoiRU5WX01FU1NBR0UiLCJzY29wZSI6ImVudmlyb25tZW50Iiwic2NvcGVJZCI6ImVudi1kZXYiLCJzZWNyZXQiOmZhbHNlLCJ2YWx1ZSI6IkRFViBlbnZpcm9ubWVudCBjb25maWd1cmF0aW9uIGxvYWRlZCJ9LHsiaWQiOiJkZXYtcHJvYmUiLCJuYW1lIjoiUEFZTUVOVFNfVkFVTFRfUFJPQkUiLCJzY29wZSI6ImVudmlyb25tZW50Iiwic2NvcGVJZCI6ImVudi1kZXYiLCJzZWNyZXQiOnRydWUsInZhbHVlIjoiIiwidmF1bHRSZWYiOiJzZWNyZXQvcGlpY28vYzMwYTBkM2ItMWMyZS00OTRjLWI5MjYtMmRiZDBjYWYyM2RiL3N0YWdpbmcvMGU5OWFkMjgtMjVjOC00YjA5LTljZmYtZWNlNTIzZjJkYjcwIn0seyJpZCI6ImRldi1leHBlY3RlZCIsIm5hbWUiOiJFWFBFQ1RFRF9FTlYiLCJzY29wZSI6ImRlcGxveW1lbnQiLCJzY29wZUlkIjoiZGVwbG95LWRldiIsInNlY3JldCI6ZmFsc2UsInZhbHVlIjoiZGV2In0seyJpZCI6InRlc3QtYXBwLWVudiIsIm5hbWUiOiJBUFBfRU5WIiwic2NvcGUiOiJlbnZpcm9ubWVudCIsInNjb3BlSWQiOiJlbnYtdGVzdCIsInNlY3JldCI6ZmFsc2UsInZhbHVlIjoidGVzdCJ9LHsiaWQiOiJ0ZXN0LW1lc3NhZ2UiLCJuYW1lIjoiRU5WX01FU1NBR0UiLCJzY29wZSI6ImVudmlyb25tZW50Iiwic2NvcGVJZCI6ImVudi10ZXN0Iiwic2VjcmV0IjpmYWxzZSwidmFsdWUiOiJURVNUIGVudmlyb25tZW50IGNvbmZpZ3VyYXRpb24gbG9hZGVkIn0seyJpZCI6InRlc3QtcHJvYmUiLCJuYW1lIjoiUEFZTUVOVFNfVkFVTFRfUFJPQkUiLCJzY29wZSI6ImVudmlyb25tZW50Iiwic2NvcGVJZCI6ImVudi10ZXN0Iiwic2VjcmV0Ijp0cnVlLCJ2YWx1ZSI6IiIsInZhdWx0UmVmIjoic2VjcmV0L3BpaWNvL2MzMGEwZDNiLTFjMmUtNDk0Yy1iOTI2LTJkYmQwY2FmMjNkYi9zdGFnaW5nLzBlOTlhZDI4LTI1YzgtNGIwOS05Y2ZmLWVjZTUyM2YyZGI3MCJ9LHsiaWQiOiJ0ZXN0LWV4cGVjdGVkIiwibmFtZSI6IkVYUEVDVEVEX0VOViIsInNjb3BlIjoiZGVwbG95bWVudCIsInNjb3BlSWQiOiJkZXBsb3ktdGVzdCIsInNlY3JldCI6ZmFsc2UsInZhbHVlIjoidGVzdCJ9LHsiaWQiOiJzdGFnaW5nLWFwcC1lbnYiLCJuYW1lIjoiQVBQX0VOViIsInNjb3BlIjoiZW52aXJvbm1lbnQiLCJzY29wZUlkIjoiZW52LXN0YWdpbmciLCJzZWNyZXQiOmZhbHNlLCJ2YWx1ZSI6InN0YWdpbmcifSx7ImlkIjoic3RhZ2luZy1tZXNzYWdlIiwibmFtZSI6IkVOVl9NRVNTQUdFIiwic2NvcGUiOiJlbnZpcm9ubWVudCIsInNjb3BlSWQiOiJlbnYtc3RhZ2luZyIsInNlY3JldCI6ZmFsc2UsInZhbHVlIjoiU1RBR0lORyBlbnZpcm9ubWVudCBjb25maWd1cmF0aW9uIGxvYWRlZCJ9LHsiaWQiOiJzdGFnaW5nLXByb2JlIiwibmFtZSI6IlBBWU1FTlRTX1ZBVUxUX1BST0JFIiwic2NvcGUiOiJlbnZpcm9ubWVudCIsInNjb3BlSWQiOiJlbnYtc3RhZ2luZyIsInNlY3JldCI6dHJ1ZSwidmFsdWUiOiIiLCJ2YXVsdFJlZiI6InNlY3JldC9waWljby9jMzBhMGQzYi0xYzJlLTQ5NGMtYjkyNi0yZGJkMGNhZjIzZGIvc3RhZ2luZy8wZTk5YWQyOC0yNWM4LTRiMDktOWNmZi1lY2U1MjNmMmRiNzAifSx7ImlkIjoic3RhZ2luZy1leHBlY3RlZCIsIm5hbWUiOiJFWFBFQ1RFRF9FTlYiLCJzY29wZSI6ImRlcGxveW1lbnQiLCJzY29wZUlkIjoiZGVwbG95LXN0YWdpbmciLCJzZWNyZXQiOmZhbHNlLCJ2YWx1ZSI6InN0YWdpbmcifV0sImVudmlyb25tZW50cyI6W3siYXBwcm92YWwiOnsiYXBwcm92ZXJHcm91cCI6IiIsInJlcXVpcmVkIjpmYWxzZX0sImRlc2NyaXB0aW9uIjoiREVWIHNtb2tlIGVudmlyb25tZW50OyB0ZW1wb3JhcnkgY29udGFpbmVyIG9uIHRoZSBHaXRIdWIgcnVubmVyLiIsImlkIjoiZW52LWRldiIsIm5hbWUiOiJkZXYifSx7ImFwcHJvdmFsIjp7ImFwcHJvdmVyR3JvdXAiOiIiLCJyZXF1aXJlZCI6ZmFsc2V9LCJkZXNjcmlwdGlvbiI6IlRFU1Qgc21va2UgZW52aXJvbm1lbnQ7IHRlbXBvcmFyeSBjb250YWluZXIgb24gdGhlIEdpdEh1YiBydW5uZXIuIiwiaWQiOiJlbnYtdGVzdCIsIm5hbWUiOiJ0ZXN0In0seyJhcHByb3ZhbCI6eyJhcHByb3Zlckdyb3VwIjoiIiwicmVxdWlyZWQiOmZhbHNlfSwiZGVzY3JpcHRpb24iOiJTVEFHSU5HIHNtb2tlIGVudmlyb25tZW50OyB0ZW1wb3JhcnkgY29udGFpbmVyIG9uIHRoZSBHaXRIdWIgcnVubmVyLiIsImlkIjoiZW52LXN0YWdpbmciLCJuYW1lIjoic3RhZ2luZyJ9XSwiZ2l0aHViQWN0aW9uc1J1bm5lciI6InVidW50dS0yNC4wNCIsImltYWdlcyI6W3siYmFzZUltYWdlIjoibmdpbng6YWxwaW5lIiwiYnVpbGRKb2JJZCI6InByZXBhcmUtc21va2UiLCJkb2NrZXJmaWxlUGF0aCI6Ii4vRG9ja2VyZmlsZSIsImdpdGh1YkFjdGlvbnNCdWlsZENvbnRleHRBcnRpZmFjdCI6InZhdWx0LXNtb2tlLWNvbnRleHQiLCJpZCI6InNtb2tlLWltYWdlIiwibmFtZSI6InBpaWNvLXZhdWx0LXNtb2tlIiwidGFncyI6WyJkZW1vIl19XSwiaW50ZWdyYXRpb25zIjpbXSwibmFtZSI6InZhdWx0LXNtb2tlLXRlc3QiLCJyYXdQYXNzdGhyb3VnaCI6W10sInJlcG9zaXRvcmllcyI6eyJhZGRpdGlvbmFsIjpbXSwicHJpbWFyeSI6eyJicmFuY2hQYXR0ZXJuIjoibWFpbiIsImNvbmN1cnJlbmN5Ijp7ImNhbmNlbEluUHJvZ3Jlc3MiOnRydWUsImVuYWJsZWQiOnRydWUsImdyb3VwIjoiJHt7IGdpdGh1Yi53b3JrZmxvdyB9fS0ke3sgZ2l0aHViLnJlZiB9fSJ9LCJnaXRodWJDaGVja291dCI6eyJuYW1lIjoiQ2hlY2tvdXQgc291cmNlIiwidmVyc2lvbiI6InY0In0sImlkIjoicmVwby1wcmltYXJ5IiwibWFudWFsSW5wdXRzIjpbXSwibWFudWFsVHJpZ2dlciI6dHJ1ZSwicGF0aCI6InNyaWhhcmktOTc2L3ZhdWx0LXNtb2tlLXRlc3QiLCJwYXRoRmlsdGVyIjoiIiwicHJvdmlkZXIiOiJHaXRIdWIiLCJyZWYiOiJtYWluIiwidGFnUGF0dGVybiI6IiIsInRyaWdnZXJNb2RlIjoibWFudWFsIn19LCJzZWN1cml0eSI6eyJldmlkZW5jZUJ1bmRsZSI6eyJlbmFibGVkIjpmYWxzZSwib3V0cHV0cyI6eyJhcnRpZmFjdCI6ZmFsc2UsImpvYlN1bW1hcnkiOnRydWUsInByQ29tbWVudCI6ZmFsc2V9fSwiZ2F0ZU1vZGUiOiJlbmZvcmNlIiwiaW1hZ2VTaWduaW5nIjp7ImVuYWJsZWQiOmZhbHNlLCJtZXRob2QiOiJrZXlsZXNzLW9pZGMifSwibGljZW5zZVBvbGljeSI6Im9yZ2FuaXphdGlvbi1kZWZhdWx0Iiwic2JvbSI6eyJlbmFibGVkIjpmYWxzZSwiZm9ybWF0IjoiY3ljbG9uZWR4In19fQ==
+# Piπco body sha256: c9854ac5f783789a018c53c0792572cae84d39a3eeeb7957f337b7d079ca8389
